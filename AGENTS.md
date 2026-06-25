@@ -23,33 +23,34 @@ kit-microsaas is NOT a SaaS platform. It is a **MicroSaaS kit**: a collection of
 
 ```
 kit-microsaas/
+├── .gitignore
 ├── cmd/main.go              → Entry point. Wires middleware, starts cleanup goroutine, registers routes.
-├── config/config.go         → Env loading. Simpler than platform-go (no SessionKey, no Resend, no SuperadminEmail).
+├── config/config.go         → Env loading. Has IsDevelopment() helper for dev-mode bypass.
 ├── db/
 │   ├── db.go                → var Conn *sql.DB global, Open(), Close(), Migrate() with embedded migrations.
 │   └── migrations/
-│       ├── k001_rate_limits.sql
-│       ├── k002_tools.sql
-│       ├── k003_downloads.sql
-│       ├── k004_payments.sql
-│       └── k005_idempotency.sql
+│       ├── k001-k009        → 9 migrations. k006 adds token_hash, k007 idempotency TTL,
+│                               k008 docgen file columns, k009 file_name_markers + data_rows.
 ├── middleware/
-│   ├── middleware.go        → Recovery (panic handler with generic 500 page), Chain (compose middlewares).
-│   └── security.go          → SecurityHeaders (CSP, XFO, nosniff, Referrer-Policy, Permissions-Policy),
-│                              HSTS, HTTPSRedirect (production only), CORS, RequestLogger.
-├── csrf/csrf.go             → Double Submit Cookie. Same as platform-go but accepts `secure bool` for production.
-├── ratelimit/ratelimit.go   → DB-backed rate limiting (IP + resource key). Same as platform-go.
-├── storage/storage.go       → Local file storage. Added SaveWithValidation: 10MB limit, MIME type whitelist,
-│                              reads full content to DetectContentType (prevents extension spoofing).
-├── template/template.go     → Multi-directory html/template engine. Simplified: no User, no EnrichData,
-│                              no superadmin, no stock/sort functions. Sanitized errors in production.
-├── security/token.go        → GenerateToken (64 hex chars crypto/rand), GenerateID (UUIDv4),
-│                              VerifyHMAC (SHA-256 for Flow.cl webhooks), HashToken (SHA-256 for stored tokens).
-├── cleanup/cleanup.go       → Background goroutine: deletes expired downloads (unpaid >24h) + their files + rate limits.
+│   ├── middleware.go        → Recovery (panic handler, outermost), Chain (last middleware = innermost).
+│   └── security.go          → SecurityHeaders, HSTS, HTTPSRedirect, CORS, RequestLogger.
+├── csrf/csrf.go             → Double Submit Cookie. Exempts /webhook/flow from CSRF.
+├── ratelimit/ratelimit.go   → DB-backed rate limiting (IP + resource key).
+├── storage/storage.go       → Local file storage. SaveWithValidation: 10MB limit, MIME whitelist.
+├── docgen/handler.go        → DocGen handler: ~670 lines (marker extraction, Excel gen, ZIP gen,
+│                              Flow.cl payment, webhook). Statuses: draft → ready → paid → expired.
+├── template/template.go     → Multi-directory html/template engine. CSRFToken set by Render().
+│                              TemplateData has IdempotencyKey field.
+├── security/token.go        → GenerateToken (64 hex), GenerateID (UUIDv4),
+│                              VerifyHMAC (SHA-256 for Flow.cl), HashToken (SHA-256).
+├── cleanup/cleanup.go       → Goroutine every 1h: deletes expired downloads + files + rate limits.
 ├── views/
-│   ├── layout.html           → Tailwind shell. No user nav, no subscription status.
-│   ├── index.html            → Tool catalog grid (currently one tool: DocGen).
-│   └── tools/docgen.html     → Upload form + pay button.
+│   ├── layout.html           → Tailwind + HTMX shell.
+│   ├── index.html            → Tool catalog grid.
+│   └── tools/
+│       ├── docgen.html       → Upload .docx form (step 1).
+│       ├── docgen-show.html  → Template detail: marker pills, Excel download, data upload, preview, pay.
+│       └── status.html       → Payment status / download link.
 ├── go.mod / go.sum
 └── AGENTS.md                 ← This file.
 ```
@@ -57,17 +58,15 @@ kit-microsaas/
 ## Schema (SQLite)
 
 ```sql
--- Anti-spam: IP-based rate limiting per tool
 CREATE TABLE rate_limits (
-    key         TEXT PRIMARY KEY,            -- "{ip}:{tool_slug}"
+    key         TEXT PRIMARY KEY,
     attempts    INTEGER NOT NULL DEFAULT 0,
-    expires_at  TEXT NOT NULL                -- ISO8601 UTC
+    expires_at  TEXT NOT NULL
 );
 
--- Tool catalog. Each tool is a row. Adding a tool = adding a row + a view.
 CREATE TABLE tools (
-    id          TEXT PRIMARY KEY,            -- UUID
-    slug        TEXT UNIQUE NOT NULL,        -- "docgen", "pdfconvert", etc
+    id          TEXT PRIMARY KEY,
+    slug        TEXT UNIQUE NOT NULL,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     price_clp   INTEGER NOT NULL DEFAULT 2990,
@@ -75,155 +74,143 @@ CREATE TABLE tools (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- One row per "intention to download". Created before payment.
 CREATE TABLE downloads (
-    id          TEXT PRIMARY KEY,            -- UUID
-    tool_id     TEXT NOT NULL REFERENCES tools(id),
-    token       TEXT UNIQUE NOT NULL,        -- 64 char hex, used as return param for Flow.cl
-    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | paid | expired
-    ip_address  TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    paid_at     TEXT,
-    expires_at  TEXT NOT NULL                -- default: created_at + 30 minutes
+    id                TEXT PRIMARY KEY,
+    tool_id           TEXT NOT NULL REFERENCES tools(id),
+    token             TEXT UNIQUE NOT NULL,
+    token_hash        TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'draft', -- draft | ready | paid | expired
+    ip_address        TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    paid_at           TEXT,
+    expires_at        TEXT NOT NULL,
+    file_path         TEXT NOT NULL DEFAULT '',      -- path to template .docx (draft) or result ZIP (paid)
+    markers           TEXT NOT NULL DEFAULT '[]',    -- JSON array of detected {{markers}}
+    file_name_markers TEXT NOT NULL DEFAULT '[]',    -- JSON array of markers used for filenames
+    data_rows         TEXT                           -- JSON array of parsed Excel rows
 );
 
--- One-shot payment record. No subscription. No recurring.
 CREATE TABLE payments (
-    id              TEXT PRIMARY KEY,        -- UUID
+    id              TEXT PRIMARY KEY,
     download_id     TEXT NOT NULL REFERENCES downloads(id),
-    amount          INTEGER NOT NULL,        -- CLP (integer, no floats)
+    amount          INTEGER NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',  -- pending | confirmed | failed
-    payment_token   TEXT,                    -- idempotency token from client
-    flow_token      TEXT,                    -- Flow.cl payment identifier
-    flow_order      TEXT,                    -- Flow.cl order number
+    payment_token   TEXT,
+    flow_token      TEXT,
+    flow_order      TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     confirmed_at    TEXT,
     error_message   TEXT
 );
 
--- Prevents double charge on page refresh
 CREATE TABLE idempotency_keys (
-    key         TEXT PRIMARY KEY,            -- UUID generated by frontend
-    response    TEXT,                        -- JSON of the response to replay
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    key         TEXT PRIMARY KEY,
+    response    TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at  TEXT
 );
 ```
 
-## Pay-per-event Flow (critical audit surface)
+## DocGen Flow (current implementation)
 
 ```
-  Browser                         kit-microsaas                    Flow.cl (Chile)
-    │                                  │                               │
-    │  POST /tools/docgen              │                               │
-    │  (form data + idempotency_key)   │                               │
-    │─────────────────────────────────>│                               │
-    │                                  │  1. Rate limit check (IP)     │
-    │                                  │  2. Idempotency check         │
-    │                                  │  3. INSERT downloads (pending)│
-    │                                  │  4. Save file to storage/     │
-    │                                  │  5. POST /api/payment/create  │
-    │                                  │──────────────────────────────>│
-    │  302 → {flow_url} (hosted page)  │                               │
-    │<─────────────────────────────────│                               │
-    │                                  │                               │
-    │  User pays on Flow.cl page       │                               │
-    │─────────────────────────────────────────────────────────────────>│
-    │                                  │                               │
-    │                                  │  POST /webhook/flow           │
-    │                                  │  (Flow.cl calls this)         │
-    │                                  │<──────────────────────────────│
-    │                                  │  6. Verify HMAC signature     │
-    │                                  │  7. Mark payment confirmed    │
-    │                                  │  8. Mark download paid        │
-    │                                  │  9. Generate download_token   │
-    │                                  │                               │
-    │  User returns to /status/{token} │                               │
-    │─────────────────────────────────>│                               │
-    │  GET /download/{download_token}  │                               │
-    │─────────────────────────────────>│                               │
-    │  File (single-use, 30min expiry) │                               │
-    │<─────────────────────────────────│                               │
+  Browser                              kit-microsaas (dev: no Flow.cl)
+
+  │  GET /tools/docgen                                        │
+  │──────────────────────────────────────────────────────────>│
+  │  < form: upload .docx >                                   │
+  │<──────────────────────────────────────────────────────────│
+  │                                                            │
+  │  POST /tools/docgen (upload .docx)                        │
+  │──────────────────────────────────────────────────────────>│
+  │  1. Rate limit check (10 req/h per IP)                    │
+  │  2. Extract {{markers}} from Word XML                     │
+  │  3. Save .docx to storage/uploads/{id}/template.docx      │
+  │  4. INSERT download (status='draft')                      │
+  │  5. Redirect → /tools/docgen/{id}                         │
+  │<──────────────────────────────────────────────────────────│
+  │                                                            │
+  │  GET /tools/docgen/{id}                                   │
+  │──────────────────────────────────────────────────────────>│
+  │  < markers as colored pills (HTMX toggle) >               │
+  │  < download template.xlsx link >                          │
+  │  < upload Excel form >                                    │
+  │  < preview table + pay button (if data loaded) >          │
+  │<──────────────────────────────────────────────────────────│
+  │                                                            │
+  │  POST /tools/docgen/{id}/filename-markers (HTMX)          │
+  │──────────────────────────────────────────────────────────>│
+  │  6. Toggle marker in file_name_markers JSON               │
+  │  7. HX-Refresh → page reloads with updated pill colors    │
+  │<──────────────────────────────────────────────────────────│
+  │                                                            │
+  │  GET /tools/docgen/{id}/template.xlsx                     │
+  │──────────────────────────────────────────────────────────>│
+  │  8. Generate Excel with markers as column headers         │
+  │<── plantilla.xlsx ────────────────────────────────────────│
+  │                                                            │
+  │  POST /tools/docgen/{id}/data (upload Excel)              │
+  │──────────────────────────────────────────────────────────>│
+  │  9. Validate headers match markers                        │
+  │  10. Parse rows → store as data_rows JSON                 │
+  │  11. UPDATE status='ready'                                │
+  │  12. Redirect → /tools/docgen/{id} (shows preview)        │
+  │<──────────────────────────────────────────────────────────│
+  │                                                            │
+  │  POST /tools/docgen/{id}/pay                              │
+  │──────────────────────────────────────────────────────────>│
+  │  DEV MODE:                                                │
+  │  13. Generate ZIP from stored docx + markers + data       │
+  │  14. Save to storage/downloads/{id}/documentos.zip        │
+  │  15. UPDATE status='paid', file_path=zipPath              │
+  │  16. INSERT payment (confirmed)                           │
+  │  17. Redirect → /download/{token}                         │
+  │  ────────────────────────────────────────────────────────>│
+  │                                                            │
+  │  PRODUCTION:                                              │
+  │  13. POST /api/payment/create to Flow.cl                  │
+  │  14. Redirect user to Flow.cl hosted page                 │
+  │  ────────────────────────────────────────────────────────>│
+  │  15. Flow.cl calls POST /webhook/flow                     │
+  │  16. Webhook calls generateAndServe() + inserts payment   │
+  │  17. User redirected to /status/{token}                   │
+  │                                                            │
+  │  GET /download/{token}                                    │
+  │──────────────────────────────────────────────────────────>│
+  │  18. Serve ZIP file (no single-use, status stays 'paid')  │
+  │<── documentos.zip ────────────────────────────────────────│
 ```
 
 ## Security model (audit checklist)
 
 | Concern | Implementation |
 |---------|---------------|
-| **CSRF** | Double Submit Cookie. Cookie value must match header `X-CSRF-Token` or form field `_csrf`. Constant-time comparison. |
-| **XSS** | Go `html/template` auto-escapes. CSP restricts script/style sources. |
+| **CSRF** | Double Submit Cookie. HTMX sends `X-CSRF-Token` header via `hx-headers`. Exempt: `/webhook/flow`. |
+| **XSS** | Go `html/template` auto-escapes. CSP restricts script/style sources (CDN only). Added `unpkg.com` to CSP for HTMX. |
 | **SQL injection** | All queries use parameterized placeholders (`?`). No string concatenation. |
 | **Path traversal** | `storage.resolve()` normalizes path and checks `filepath.Rel` does not start with `..`. |
 | **File upload** | `SaveWithValidation()` reads into memory, checks `http.DetectContentType` against whitelist, enforces 10MB limit. |
-| **Rate limiting** | Per `{IP}:{tool}` key in SQLite. Window is configurable. `Check()` is atomic within a transaction. |
-| **Download token** | 64 random hex chars from `crypto/rand`. Stored hashed (SHA-256). Single-use (deleted after download). 30min TTL. |
-| **Payment idempotency** | Client sends `idempotency_key` (UUIDv4). Server checks `idempotency_keys` table before creating payment. Same key = same response replayed. |
-| **Webhook HMAC** | Flow.cl signs requests with shared secret. `VerifyHMAC()` validates SHA-256 HMAC before processing confirmation. |
+| **Rate limiting** | Per `{IP}:docgen` key in SQLite. 10 req/h window. `Check()` is atomic within a transaction. |
+| **Download token** | 64 random hex chars from `crypto/rand`. Stored hashed (SHA-256) as `token_hash`. 1h TTL (extendable). |
+| **Webhook HMAC** | Flow.cl signs requests with shared secret. `VerifyHMAC()` validates SHA-256 HMAC before processing. |
 | **Error leakage** | In production, all errors return generic "Error interno del servidor". Full error logged server-side only. |
 | **Security headers** | CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff, HSTS (1 year, preload), Referrer-Policy, Permissions-Policy. |
 | **HTTPS** | Production only: redirects all HTTP to HTTPS (301). |
 | **CORS** | Configurable via `ALLOWED_ORIGINS` env var. Disabled by default (empty = no CORS header). |
-| **Cleanup** | Goroutine every 1h: deletes expired downloads (unpaid >24h), their storage files, associated payments, expired rate limits. |
-
-## What is intentionally missing (and why)
-
-| Missing | Reason |
-|---------|--------|
-| **Auth / Login / Registration** | Anonymous-first. No user identity means no password hashing, no session tokens, no password reset, no email verification. These are the largest source of breaches in web apps. |
-| **User database** | No users table. No profiles. No GDPR identity to manage. |
-| **Email sending** | No Resend, no SendGrid, no SMTP. Micro-tools do not send welcome emails, invoices, or marketing. If email is needed, it is added per-tool, not as platform infrastructure. |
-| **Multi-tenant** | No companies, no teams, no roles (admin/editor/viewer). Every user is anonymous and equal. |
-| **Feature flags / modules** | No `company_modules` table. A tool is active or not — globally. Adding a tool is a DB row + a route + a view. |
-| **Audit log** | No `audit_log` table. There is no user to audit. Payment records serve as audit trail. |
-| **Admin panel** | No dashboard, no graphs, no "total users" counter. Revenue = SELECT SUM(amount) FROM payments WHERE status = 'confirmed'. That's it. |
-| **WebSocket / real-time** | Not needed. The transaction is request-response: upload → pay → download. |
-| **Queue / async jobs** | Not needed yet. Cleanup is a simple goroutine. If a tool needs async processing, it is added per-tool. |
-| **Database migrations framework** | Custom ~60 lines instead of golang-migrate. Each migration is an embedded SQL file. The schema has 5 tables. A framework is overkill. |
-
-## Dependencies
-
-```
-modernc.org/sqlite           → Pure Go SQLite (no CGO). WAL mode, busy_timeout 5000ms.
-github.com/google/uuid       → UUIDv4 for primary keys.
-golang.org/x/sys             → Indirect, required by modernc.org/sqlite.
-```
-
-No web framework. No ORM. No auth library. No email client. No Redis. No Docker (yet).
-
-Total external dependencies: **1 direct** (modernc.org/sqlite).
-
-## Relationship to platform-go
-
-This kit is a fork-simplification of `github.com/tmontenegrop/platform-go`, which is the SaaS starter kit used by Listock (inventory management, login required, subscription billing, multi-tenant).
-
-**What was removed from platform-go:**
-- `auth/` (370 lines) → no login
-- `billing/` (202 lines) → rewritten for one-shot
-- `email/` (143 lines) → no email
-- `audit/` (40 lines) → no audit log
-- `modules/` (37 lines) → no feature flags
-- `roles/` (35 lines) → no roles
-- 10 embedded migrations → replaced with 5 simpler ones
-- ~60% of template, middleware, config
-
-**What was added:**
-- `security/token.go` → centralized crypto helpers
-- `cleanup/cleanup.go` → TTL-based garbage collection
-- Upload validation (size + MIME)
-- Security headers, HSTS, HTTPS redirect, CORS
-- Idempotency table
-
-## Questions an auditor should ask
-
-1. **Is the rate limiting enough for anonymous abuse?** The `ratelimit.Check()` uses IP as key. A bot behind a NAT shares an IP with legitimate users. Should we add a lightweight challenge (e.g., proof-of-work or Turnstile) before the pay step?
-2. **Is reading the entire upload into memory safe?** `SaveWithValidation` calls `io.ReadAll` with a limit reader. For a 10MB file this is fine. For larger files it would OOM. The limit is enforced.
-3. **Is the idempotency key truly reliable?** It relies on the client generating a UUIDv4 and sending it with the POST. If the client fails to send one (JS disabled, curl without the field), the server creates a new key. This means a double-click from a naive client could still double-charge. Should the server generate the key and return it as a hidden field?
-4. **What happens if Flow.cl webhook is delayed?** The download token expires in 30 minutes. If Flow.cl takes longer to call the webhook (rare but possible), the user pays but cannot download. Should the expiry be extended on payment confirmation?
-5. **Is CSP too restrictive?** Tailwind CDN requires `'unsafe-inline'` for both script and style. In production, Tailwind should be built statically and served from `'self'`, removing the need for `'unsafe-inline'`.
-6. **Should download tokens be hashed in the database?** Currently the token is stored in plaintext in `downloads.token`. If the DB is leaked, an attacker can download any paid file. The token should be stored as SHA-256 hash, and the original token returned only in the payment redirect URL.
+| **Cleanup** | Goroutine every 1h: expired downloads (draft/ready >24h) → status='expired', deletes upload files. |
 
 ## Current state
 
 - **Compiles**: `go build ./...` passes
 - **Vet**: `go vet ./...` passes
-- **Tests**: None yet. The kit is in design phase, no business logic has been implemented beyond the skeleton.
-- **Production**: Not deployed. Waiting on first tool (DocGen) implementation and Flow.cl integration.
+- **Tests**: None yet.
+- **Production**: Not deployed.
+- **Dev mode**: Pay handler bypasses Flow.cl, generates ZIP directly and serves download.
+- **HTMX**: Used for marker toggle (`HX-Refresh`), included via CDN (unpkg). CSP updated to allow `unpkg.com`.
+- **Tailwind**: CDN via `cdn.tailwindcss.com`. In production should be compiled statically.
+- **excelize/v2**: Added for Excel template generation and data parsing.
+
+## Bugs corregidos
+
+1. **CSP bloqueaba HTMX** — `script-src` no incluía `unpkg.com`, el navegador bloqueaba la carga de HTMX. Todos los `hx-*` attributes eran ignorados. Fix: agregar `https://unpkg.com` a `script-src`.
+2. **hx-vals enviaba JSON, handler esperaba form-urlencoded** — `hx-vals='{"marker": "{{.Name}}"}'` enviaba JSON pero `ToggleFileNameMarker` usaba `r.FormValue("marker")` que solo lee form-urlencoded. Fix: cambiado a usar `<form hx-post=...>` con `<input type="hidden" name="marker">`.

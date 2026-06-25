@@ -1,6 +1,6 @@
 # Auditoría de kit-microsaas
 
-**Auditor:** LLM Auditor | **Fecha:** 2026-06-25 | **Archivos auditados:** 11 `.go` + 5 `.sql` + `AGENTS.md`
+**Auditor:** LLM Auditor | **Fecha:** 2026-06-25 (v2) | **Archivos auditados:** 11 `.go` + 5 `.sql` + `AGENTS.md`
 
 ---
 
@@ -205,6 +205,22 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 - **Dónde:** `db/migrations/k005_idempotency.sql`
 - **Problema:** La tabla crece sin límite. Cada request de pago agrega una fila. En producción con miles de pagos, la tabla crece indefinidamente.
 - **Recomendación:** Agregar columna `expires_at` o incluir idempotency_keys en el cleanup job (borrar >7 días).
+
+---
+
+### Bugs encontrados y corregidos durante desarrollo
+
+**🐛 CSP bloqueaba HTMX — CORREGIDO**
+- **Dónde:** `middleware/security.go:10`
+- **Problema:** `script-src` incluía `'self'`, `cdn.tailwindcss.com` y `'unsafe-inline'` pero NO incluía `unpkg.com` (de donde se carga HTMX). El navegador bloqueaba la descarga del script HTMX, todos los `hx-*` atributos eran ignorados, los botones de marcadores no funcionaban.
+- **Fix:** Agregar `https://unpkg.com` a `script-src` en la CSP.
+- **Gravedad:** 🔴 CRÍTICO (app parecía funcionar pero toda interacción HTMX estaba rota)
+
+**🐛 hx-vals incompatible con handler Go — CORREGIDO**
+- **Dónde:** `views/tools/docgen-show.html:12`, `docgen/handler.go:177-212`
+- **Problema:** `hx-vals='{"marker": "{{.Name}}"}'` envía los datos como `application/json` en el body, pero `ToggleFileNameMarker` usa `r.FormValue("marker")` que solo parsea `application/x-www-form-urlencoded`. El handler nunca recibía el marcador, el toggle no funcionaba.
+- **Fix:** Cambiado a `<form hx-post=...>` con `<input type="hidden" name="marker" value="{{.Name}}">`. HTMX serializa el form como form-urlencoded automáticamente.
+- **Gravedad:** 🔴 CRÍTICO (funcionalidad de marcadores completamente rota)
 
 ---
 
