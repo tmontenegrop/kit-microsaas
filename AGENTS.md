@@ -206,12 +206,26 @@ CREATE TABLE idempotency_keys (
 - **Tests**: None yet.
 - **Production**: Not deployed.
 - **Dev mode**: Pay handler bypasses Flow.cl, generates ZIP directly and serves download.
-- **HTMX**: Used for marker toggle (`HX-Refresh`), included via CDN (unpkg). CSP updated to allow `unpkg.com`.
+- **HTMX**: Used for marker toggle (`HX-Refresh`), included via CDN (unpkg).
 - **Tailwind**: CDN via `cdn.tailwindcss.com`. In production should be compiled statically.
 - **excelize/v2**: Added for Excel template generation and data parsing.
 - **Roadmaps**: `roadmap-produccion.md` (high-level phases), `roadmap-detallado.md` (concrete tasks per file), `TODO.md` (quick checklist).
+- **Auditoria findings resolved**: 7 of 11 original findings fixed. Remaining: CSP cleanup, context.Context, template race, Flow.cl real integration.
 
 ## Bugs corregidos
 
-1. **CSP bloqueaba HTMX** — `script-src` no incluía `unpkg.com`, el navegador bloqueaba la carga de HTMX. Todos los `hx-*` attributes eran ignorados. Fix: agregar `https://unpkg.com` a `script-src`.
-2. **hx-vals enviaba JSON, handler esperaba form-urlencoded** — `hx-vals='{"marker": "{{.Name}}"}'` enviaba JSON pero `ToggleFileNameMarker` usaba `r.FormValue("marker")` que solo lee form-urlencoded. Fix: cambiado a usar `<form hx-post=...>` con `<input type="hidden" name="marker">`.
+1. **CSP bloqueaba HTMX** — `script-src` no incluía `unpkg.com`, el navegador bloqueaba la carga de HTMX. Fix: agregar `https://unpkg.com` a `script-src`.
+2. **hx-vals enviaba JSON, handler esperaba form-urlencoded** — `hx-vals='{"marker": "{{.Name}}"}'` enviaba JSON pero `ToggleFileNameMarker` usa `r.FormValue("marker")` (form-urlencoded). Fix: `<form hx-post>` con hidden input.
+3. **generateAndServe sin transacción** — Dos `db.Exec()` separados para UPDATE download + INSERT payment. Fix: envuelto en `Begin()` / `Commit()`.
+4. **Webhook payment updates sin transacción** — Múltiples `db.Exec()` sin atomicidad. Fix: envuelto en transacción.
+
+## Hallazgos de auditoría ya corregidos
+
+- ✅ Download tokens hasheados (k006 + handler.go usa `HashToken()`)
+- ✅ `ratelimit.Check()` propaga errores de Commit
+- ✅ `isRequestSecure()` eliminada, `setCookie()` recibe `secure` de `cfg.IsProduction()`
+- ✅ Cleanup race condition: usa `UPDATE status='expired'` con `RowsAffected`
+- ✅ Cleanup atómico: transacción explícita
+- ✅ CSRF error logging con `slog.Error`
+- ✅ CORS methods: solo `GET, POST, OPTIONS`
+- ✅ TTL en `idempotency_keys` (k007 + cleanup)

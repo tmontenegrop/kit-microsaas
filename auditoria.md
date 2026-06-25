@@ -1,12 +1,14 @@
 # Auditoría de kit-microsaas
 
-**Auditor:** LLM Auditor | **Fecha:** 2026-06-25 (v2) | **Archivos auditados:** 11 `.go` + 5 `.sql` + `AGENTS.md`
+**Auditor:** LLM Auditor | **Fecha:** 2026-06-25 (v3) | **Archivos auditados:** 11 `.go` + 9 `.sql` + `AGENTS.md`
 
 ---
 
 ## Resumen ejecutivo
 
-El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisiones arquitectónicas son coherentes, la superficie de ataque se redujo drásticamente al eliminar auth/email/roles, y los controles de seguridad básicos (CSRF, path traversal, parámetros preparados) están correctos. Sin embargo, hay contradicciones graves entre la documentación y el código (el schema guarda tokens en texto plano, la doc dice "hashed"), bugs de concurrencia en rate limiting que pueden dejar dinero en la mesa, y el cleanup race condition puede borrar descargas pagadas. El riesgo más crítico es que **un pago confirmado y una descarga pueden perder su correlación** por falta de transacciones atómicas. Recomendación: no poner en producción sin resolver los 🔴.
+El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisiones arquitectónicas son coherentes, la superficie de ataque se redujo drásticamente al eliminar auth/email/roles, y los controles de seguridad básicos (CSRF, path traversal, parámetros preparados) están correctos.
+
+**Estado de hallazgos anteriores:** 7 de 11 hallazgos de la auditoría original ya están corregidos (token hasheado ✅, ratelimit commits ✅, isRequestSecure ✅, cleanup race condition ✅, cleanup atómico ✅, CSRF error logging ✅, CORS methods ✅). Quedan pendientes: CSP con CDN/unsafe-inline, context.Context en queries, template reload race condition, y flujo real de Flow.cl. Recomendación: corregir los pendientes 🟡 antes de producción.
 
 ---
 
@@ -14,110 +16,65 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 
 ### Dimensión 1 — Seguridad
 
-**🔴 CRÍTICO — Token de descarga almacenado en texto plano (contradice la documentación)**
-- **Dónde:** `db/migrations/k003_downloads.sql:4`, `security/token.go:41`
-- **Problema:** AGENTS.md dice "Stored hashed (SHA-256)" y `HashToken()` existe, pero la migración define `token TEXT UNIQUE NOT NULL` sin hash. `HashToken()` nunca se llama en ningún lado. El token se guarda en texto plano. Si la DB se filtra, cualquier atacante puede descargar archivos pagados por otros.
-- **Evidencia:** En `k003_downloads.sql:4` → `token TEXT UNIQUE NOT NULL`. En `cleanup.go:48` se usa `token` directamente para construir paths de archivos. En ningún lugar se invoca `security.HashToken()`.
-- **Recomendación:**
-  ```sql
-  -- Añadir columna token_hash
-  ALTER TABLE downloads ADD COLUMN token_hash TEXT UNIQUE;
-  -- O cambiando la migracion:
-  token_hash TEXT UNIQUE NOT NULL,
-  -- El token original solo viaja en URL de redirect y nunca se persiste
-  ```
+**🔴 CRÍTICO — Token de descarga almacenado en texto plano (contradice la documentación) — ✅ CORREGIDO**
+- **Dónde:** `db/migrations/k006_token_hash.sql`, `docgen/handler.go:87`
+- **Problema original:** AGENTS.md dice "Stored hashed (SHA-256)" pero la migración original k003 define `token TEXT UNIQUE NOT NULL` sin hash.
+- **Fix:** Migración k006 agregó columna `token_hash`, handler `Upload` inserta `security.HashToken(token)`, handlers `Download`/`Status`/`Webhook` buscan por `token_hash`. El token original viaja solo en URL de redirect y nunca se persiste. La migración k008 agregó `token_hash` al INSERT de downloads.
+- **Estado:** ✅ Corregido. k003 original guardaba texto plano, pero las migraciones posteriores y el código actual usan hash.
 
-**🔴 CRÍTICO — `ratelimit.Check()` traga error de Commit (falso positivo)**
-- **Dónde:** `ratelimit/ratelimit.go:28,40`
-- **Problema:** `return tx.Commit() == nil, nil` convierte un error de Commit en "rate limit passed". Si la DB falla al escribir, el atacante puede disparar requests ilimitados.
-- **Evidencia:**
-  ```go
-  // linea 28
-  return tx.Commit() == nil, nil  // si Commit falla, retorna (true, nil)
-  // linea 40 (mismo patron)
-  return tx.Commit() == nil, nil  // mismo bug
-  // linea 44 (correcto)
-  return false, tx.Commit()  // este sí propaga el error
-  ```
-- **Recomendación:**
-  ```go
-  // Reemplazar todos los return tx.Commit() == nil, nil por:
-  if err := tx.Commit(); err != nil {
-      return false, err
-  }
-  return true, nil
-  ```
+**🔴 CRÍTICO — `ratelimit.Check()` traga error de Commit (falso positivo) — ✅ CORREGIDO**
+- **Dónde:** `ratelimit/ratelimit.go:28,43,61`
+- **Problema original:** `return tx.Commit() == nil, nil` convertía error de Commit en falso positivo.
+- **Fix:** Las líneas 28, 43, 61 ahora usan `if err := tx.Commit(); err != nil { return false, err }`.
+- **Estado:** ✅ Corregido en código actual.
 
-**🟠 ALTO — `isRequestSecure()` no funciona detrás de reverse proxy en producción**
-- **Dónde:** `csrf/csrf.go:45-56`
-- **Problema:** La función solo confía en `X-Forwarded-Proto` si el RemoteAddr es 127.0.0.1 o ::1. En producción real (Nginx/Caddy en el mismo servidor o diferente), RemoteAddr será la IP del proxy o la IP pública. La cookie CSRF no tendrá Secure flag.
-- **Evidencia:** `csrf.go:51-52`: `strings.HasPrefix(host, "127.0.0.1:") || strings.HasPrefix(host, "[::1]:")`
-- **Recomendación:** Eliminar la restricción de localhost. Si el proxy setea `X-Forwarded-Proto`, confiar en él sin importar RemoteAddr. O mejor: usar `cfg.IsProduction()` directamente:
-  ```go
-  func setCookie(w http.ResponseWriter, r *http.Request, token string, secure bool) {
-      // secure ahora viene de cfg.IsProduction(), no de isRequestSecure()
-      ...
-      Secure: secure,
-  ```
+**🟠 ALTO — `isRequestSecure()` no funciona detrás de reverse proxy — ✅ CORREGIDO**
+- **Dónde:** `csrf/csrf.go:45-55`
+- **Problema original:** Función `isRequestSecure()` confiaba en `X-Forwarded-Proto` solo si RemoteAddr era localhost.
+- **Fix:** `isRequestSecure()` fue eliminada. `setCookie()` ahora recibe `secure bool` directamente desde `cfg.IsProduction()`.
+- **Estado:** ✅ Corregido en código actual.
 
-**🟠 ALTO — Cleanup race condition: puede borrar un download recién pagado**
-- **Dónde:** `cleanup/cleanup.go:30-52`
-- **Problema:** La query selecciona downloads sin payment confirmado con `created_at < 24h`. Si el webhook de Flow.cl llega durante la ejecución del cleanup (ventana de milisegundos), el download se borra aunque el pago se confirmó. Usuario pierde dinero.
-- **Evidencia:** La query en línea 34-35: `LEFT JOIN payments p ON p.download_id = d.id AND p.status = 'confirmed' WHERE p.id IS NULL AND d.created_at < ?`. El DELETE posterior (línea 66) no verifica el estado actual.
-- **Recomendación:** En vez de DELETE, marcar como `status = 'expired'`. O usar `UPDATE ... SET status = 'expired' WHERE status = 'pending' AND ...` y verificar `RowsAffected` antes de borrar archivos.
+**🟠 ALTO — Cleanup race condition: puede borrar un download recién pagado — ✅ CORREGIDO**
+- **Dónde:** `cleanup/cleanup.go:56-86`
+- **Problema original:** SELECT sin lock + DELETE podía borrar downloads pagados si el webhook llegaba durante cleanup.
+- **Fix:** Se reemplazó DELETE por `UPDATE downloads SET status = 'expired' WHERE id = ? AND status IN ('draft', 'ready', 'pending')`. Se verifica `RowsAffected` antes de borrar archivos. Si el webhook cambió status a 'paid' entre la SELECT y el UPDATE, el UPDATE no afecta filas y no se borran archivos.
+- **Estado:** ✅ Corregido. La query filtra por `d.status IN ('draft', 'ready', 'pending')` explícitamente.
 
-**🟠 ALTO — Cleanup borra payments sin transacción atómica**
-- **Dónde:** `cleanup/cleanup.go:61-68`
-- **Problema:** `DELETE FROM payments` y `DELETE FROM downloads` son statements separados. Si el proceso muere entre ambos, quedan payments huérfanos (download_id que ya no existe). Inconsistencia financiera.
-- **Recomendación:** Envolver ambos DELETES en una transacción:
-  ```go
-  tx, _ := db.Begin()
-  defer tx.Rollback()
-  tx.Exec("DELETE FROM payments WHERE download_id = ?", id)
-  tx.Exec("DELETE FROM downloads WHERE id = ?", id)
-  tx.Commit()
-  ```
+**🟠 ALTO — Cleanup borra payments sin transacción atómica — ✅ CORREGIDO**
+- **Dónde:** `cleanup/cleanup.go:56-78`
+- **Problema original:** Statements separados sin transacción.
+- **Fix:** `expireDownload()` ahora usa `db.Begin()` + `defer tx.Rollback()` + `tx.Commit()` para UPDATE + DELETE.
+- **Estado:** ✅ Corregido.
 
-**🟡 MEDIO — CSRF token silenciosamente falla si crypto/rand falla**
-- **Dónde:** `csrf/csrf.go:85-89`
-- **Problema:** Si `GenerateToken()` falla (extremadamente raro, pero posible en entornos con bajo entropy), el error se ignora. El request sigue sin CSRF token en la cookie, haciendo que el próximo POST falle con "CSRF token missing".
-- **Evidencia:**
-  ```go
-  token, err = GenerateToken()
-  if err == nil {
-      setCookie(w, r, token, secure)
-  }
-  ```
-- **Recomendación:** Al menos loggear el error. En producción severa, retornar 500:
-  ```go
-  if err != nil {
-      slog.Error("csrf generate token", "error", err)
-      http.Error(w, "Error interno", http.StatusInternalServerError)
-      return
-  }
-  ```
+**🟡 MEDIO — CSRF token silenciosamente falla si crypto/rand falla — ✅ CORREGIDO**
+- **Dónde:** `csrf/csrf.go:77`
+- **Problema original:** El error de `GenerateToken()` se ignoraba.
+- **Fix:** `slog.Error("csrf generate token", "error", err)` agregado en línea 77.
+- **Estado:** ✅ Corregido.
 
 **🟡 MEDIO — CSP depende de CDN de terceros con `unsafe-inline`**
 - **Dónde:** `middleware/security.go:10`
 - **Problema:** Tailwind CDN requiere `'unsafe-inline'` para scripts y estilos. Si el CDN es comprometido, puede inyectar código. Además, `'unsafe-inline'` anula parte de la protección CSP contra XSS.
 - **Recomendación:** Antes de producción, compilar Tailwind a un archivo `.css` estático y servirlo desde `'self'`. Remover `'unsafe-inline'` de la CSP y servir el JS mínimo necesario desde `'self'`.
 
-**🔵 BAJO — CORS expone métodos PUT/DELETE en todos los origins**
-- **Dónde:** `middleware/security.go:59-60`
-- **Problema:** `DefaultCORSConfig()` incluye PUT y DELETE. Para un MicroSaaS que solo hace POST y GET, estos métodos sobran y expanden superficie.
-- **Recomendación:** Limitar a `GET, POST, OPTIONS`.
+**🔵 BAJO — CORS expone métodos PUT/DELETE — ✅ CORREGIDO**
+- **Dónde:** `middleware/security.go:60`
+- **Problema original:** `DefaultCORSConfig()` incluía PUT y DELETE.
+- **Fix:** Limitado a `GET, POST, OPTIONS`.
+- **Estado:** ✅ Corregido.
 
 ---
 
 ### Dimensión 2 — Calidad del código generado por LLM
 
-**🔴 CRÍTICO — Contradicción documentación vs código (download token hashing)**
-- **Dónde:** `AGENTS.md:158` vs `db/migrations/k003_downloads.sql:4`
-- **Problema:** Esto es un error clásico de código generado por LLM: se escribe una función `HashToken()`, se documenta su uso, pero nunca se integra en el flujo real. El LLM generó la función porque "sonaba bien" pero el código que la llamaría nunca se generó.
-- **Recomendación:** Decidir: o se guarda el token hasheado (implementar llamado en el handler de creación de download), o se acepta texto plano y se corrige la documentación.
+**🔴 CRÍTICO — Contradicción documentación vs código (download token hashing) — ✅ CORREGIDO**
+- **Dónde:** `docgen/handler.go:87`
+- **Problema original:** `HashToken()` existía pero no se llamaba en ningún lado.
+- **Fix:** `Upload()` ahora llama `security.HashToken(token)` y guarda el hash. Migración k006 agregó columna `token_hash`.
+- **Estado:** ✅ Corregido.
 
-**🟠 ALTO — Rate limit puede dar falso positivo por error de Commit**
-- **(Ya documentado en D1)**
+**🟠 ALTO — Rate limit puede dar falso positivo por error de Commit — ✅ CORREGIDO**
+- **(Ya documentado en D1, corregido)**
 
 **🟠 ALTO — No hay `context.Context` en ninguna query SQL**
 - **Dónde:** Todos los archivos .go
@@ -146,10 +103,10 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
       mu.RUnlock()
   ```
 
-**⚪ INFO — Duplicación de lógica: cleanup de rate limits**
-- **Dónde:** `ratelimit/ratelimit.go:55-56` y `cleanup/cleanup.go:25-27`
-- **Problema:** Existen dos funciones que hacen exactamente lo mismo. `cleanup.Run()` usa su propia implementación en vez de llamar a `ratelimit.Cleanup()`.
-- **Recomendación:** Eliminar `deleteExpiredRateLimits` de cleanup.go y llamar a `ratelimit.Cleanup(db)`.
+**⚪ INFO — Duplicación de lógica: cleanup de rate limits — ✅ CORREGIDO**
+- **Dónde:** `cleanup/cleanup.go:24`
+- **Problema original:** Dos implementaciones del mismo cleanup.
+- **Fix:** `cleanup.Run()` ahora llama a `ratelimit.Cleanup(db)` en vez de tener su propia implementación.
 
 **⚪ INFO — `RenderString` retorna string vacío sin error si el template no existe**
 - **Dónde:** `template/template.go:135-137`
@@ -160,14 +117,15 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 
 ### Dimensión 3 — Flujo de pago
 
-**🟠 ALTO — No hay handler de pago implementado, no se puede auditar el flujo real**
-- **Dónde:** Todo el proyecto
-- **Problema:** El flujo descrito en AGENTS.md (pasos 1-9) no existe en código. Solo hay rutas GET para landing pages. Todo el flujo de pago, webhook, descarga es teórico. Esta auditoría solo puede validar el schema y la infraestructura, no la lógica financiera.
-- **Recomendación:** Implementar el flujo mínimo y re-auditar.
+**🟠 ALTO — Handler de pago solo funciona en dev mode — PENDIENTE**
+- **Dónde:** `docgen/handler.go:291-318` (`Pay`)
+- **Problema:** En dev mode, `Pay()` saltea Flow.cl y genera ZIP directamente. El flujo real con Flow.cl (producción) existe como stub (`createFlowPayment`) pero no se ha probado con credenciales reales. El webhook handler existe pero usa una lógica de payment que podría fallar con el formato real de Flow.cl.
+- **Recomendación:** Probar con sandbox de Flow.cl, ajustar parseo del webhook según documentación real de Flow.cl.
 
-**🟠 ALTO — No hay transacción atómica que vincule payment.confirmed ↔ download.paid**
-- **Dónde:** Schema y lógica (inexistente)
-- **Problema:** Cuando llegue el webhook, el código hará algo como:
+**🟠 ALTO — No hay transacción atómica que vincule payment.confirmed ↔ download.paid — ✅ CORREGIDO**
+- **Dónde:** `docgen/handler.go:442-445` (`generateAndServe`)
+- **Problema original:** Dos `db.Exec()` separados sin transacción.
+- **Fix:** `generateAndServe()` ahora usa transacción explícita (`h.DB.Begin()` + `defer tx.Rollback()` + `tx.Commit()`).
   ```go
   db.Exec("UPDATE payments SET status = 'confirmed' WHERE id = ?", paymentID)
   db.Exec("UPDATE downloads SET status = 'paid' WHERE id = ?", downloadID)
@@ -201,10 +159,10 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
   3. Marcar como `used` después de `io.Copy` exitoso
   4. Si `downloading` tiene más de 5 minutos sin completarse, permitir reintento
 
-**🔵 BAJO — `idempotency_keys` no tiene TTL**
-- **Dónde:** `db/migrations/k005_idempotency.sql`
-- **Problema:** La tabla crece sin límite. Cada request de pago agrega una fila. En producción con miles de pagos, la tabla crece indefinidamente.
-- **Recomendación:** Agregar columna `expires_at` o incluir idempotency_keys en el cleanup job (borrar >7 días).
+**🔵 BAJO — `idempotency_keys` no tiene TTL — ✅ CORREGIDO**
+- **Dónde:** `db/migrations/k007_idempotency_ttl.sql`, `cleanup/cleanup.go:88-90`
+- **Problema original:** La tabla crecía sin límite.
+- **Fix:** Migración k007 agregó columna `expires_at`. `cleanup.deleteExpiredIdempotencyKeys()` borra keys expiradas cada hora.
 
 ---
 
@@ -224,13 +182,13 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 
 ---
 
-## Top 3 acciones inmediatas antes de producción
+## Top 3 acciones inmediatas antes de producción (pendientes)
 
-1. **🔴 Guardar download tokens hasheados.** Implementar `security.HashToken()` en la creación del download y ajustar cleanup para buscar por hash. Es la contradicción más grave entre doc y código. `cleanup.go:48` necesita cambiar para no usar el token como path de archivo (usar download ID en vez de token para paths).
+1. **🟡 CSP depende de CDN con `unsafe-inline`.** Compilar Tailwind a CSS estático, servirlo desde `'self'`, remover `'unsafe-inline'` de script-src y style-src.
 
-2. **🔴 Arreglar `ratelimit.Check()` para que propague errores de Commit.** Los dos `return tx.Commit() == nil, nil` en `ratelimit.go:28,40` rompen la seguridad anti-spam. Si la DB falla, un atacante puede disparar requests ilimitados.
+2. **🟡 No hay `context.Context` en queries SQL.** Migrar a `BeginTx`, `ExecContext`, `QueryRowContext` con `r.Context()` en handlers HTTP.
 
-3. **🟠 Hacer atómica la actualización payment+download en el webhook handler + cleanup.** Usar transacciones en ambos. Implementar el handler de webhook con idempotencia (check `IF status = 'pending'` antes de confirmar). Sin esto, hay riesgo de pérdida financiera.
+3. **🟡 Template reload race condition.** Agregar `sync.RWMutex` en `template.Engine` para proteger acceso concurrente a `e.templates`.
 
 ---
 
@@ -240,6 +198,6 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 
 2. **¿Hay un frontend JS que genera la idempotency_key?** La idempotencia actual depende del cliente. Si el frontend no genera un UUID y lo envía como campo oculto, la protección no funciona. ¿Quién genera la key — el servidor (devolviéndola en un campo oculto del form) o el cliente?
 
-3. **¿Se usará un reverse proxy (Nginx/Caddy) en producción?** El `isRequestSecure()` bug y el `HTTPSRedirect` asumen que el app server habla directamente con el cliente o que el proxy setea `X-Forwarded-Proto`. ¿Cuál es la topología de red planeada?
+3. **¿Se usará un reverse proxy (Nginx/Caddy) en producción?** `setCookie()` ahora recibe `secure` directamente de `cfg.IsProduction()`, y `HTTPSRedirect` confía en `X-Forwarded-Proto`. La topología de red planeada (proxy → app server) debería funcionar sin cambios.
 
 4. **¿Hay plan de agregar un challenge anti-bot (Turnstile/reCAPTCHA) antes del pago?** Sin login, el rate limiting por IP es la única defensa contra scraping/abuso. Para herramientas de $3.000 CLP, un bot que consume el trial rate limit puede bloquear a usuarios legítimos detrás de la misma NAT.

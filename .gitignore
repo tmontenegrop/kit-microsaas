@@ -4,3 +4,4 @@ storage/uploads/
 *.exe
 *.test
 *.out
+server_*.log

@@ -393,17 +393,18 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 
 	h.generateAndServe(downloadID, token)
 
-	var price int
-	h.DB.QueryRow("SELECT price_clp FROM tools t JOIN downloads d ON d.tool_id = t.id WHERE d.id = ?", downloadID).Scan(&price)
+	tx, err := h.DB.Begin()
+	if err != nil {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	defer tx.Rollback()
 
-	// Insert payment with flow_token
-	h.DB.Exec("UPDATE payments SET flow_token = ? WHERE download_id = ? AND flow_token IS NULL", data.Token, downloadID)
-	// If no payment row exists, insert one
-	var count int
-	h.DB.QueryRow("SELECT COUNT(*) FROM payments WHERE download_id = ?", downloadID).Scan(&count)
-	if count == 0 {
-		h.DB.Exec("INSERT INTO payments (id, download_id, amount, status, flow_token) VALUES (?, ?, ?, 'confirmed', ?)",
-			security.GenerateID(), downloadID, price, data.Token)
+	tx.Exec("UPDATE payments SET flow_token = ? WHERE download_id = ?", data.Token, downloadID)
+
+	if err := tx.Commit(); err != nil {
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -438,10 +439,24 @@ func (h *Handler) generateAndServe(id, token string) {
 		return
 	}
 
-	tokenHash := security.HashToken(token)
-	h.DB.Exec("UPDATE downloads SET status = 'paid', paid_at = datetime('now'), file_path = ? WHERE id = ?", zipPath, id)
-	h.DB.Exec("INSERT INTO payments (id, download_id, amount, status) VALUES (?, ?, 2990, 'confirmed')", security.GenerateID(), id)
-	_ = tokenHash
+	tx, err := h.DB.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec("UPDATE downloads SET status = 'paid', paid_at = datetime('now'), file_path = ? WHERE id = ?", zipPath, id)
+	if err != nil {
+		return
+	}
+	_, err = tx.Exec("INSERT INTO payments (id, download_id, amount, status) VALUES (?, ?, 2990, 'confirmed')", security.GenerateID(), id)
+	if err != nil {
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		return
+	}
 }
 
 func (h *Handler) createFlowPayment(token string) (string, error) {
