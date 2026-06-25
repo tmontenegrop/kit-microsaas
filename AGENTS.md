@@ -209,6 +209,7 @@ CREATE TABLE idempotency_keys (
 - **HTMX**: Used for marker toggle (`HX-Refresh`), included via CDN (unpkg). CSP updated to allow `unpkg.com`.
 - **Tailwind**: CDN via `cdn.tailwindcss.com`. In production should be compiled statically.
 - **excelize/v2**: Added for Excel template generation and data parsing.
+- **Roadmaps**: `roadmap-produccion.md` (high-level phases), `roadmap-detallado.md` (concrete tasks per file), `TODO.md` (quick checklist).
 
 ## Bugs corregidos
 
