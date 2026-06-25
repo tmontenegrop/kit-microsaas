@@ -1,0 +1,2 @@
+ALTER TABLE downloads ADD COLUMN file_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE downloads ADD COLUMN markers TEXT NOT NULL DEFAULT '[]';

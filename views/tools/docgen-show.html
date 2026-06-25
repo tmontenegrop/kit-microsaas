@@ -1,0 +1,81 @@
+{{define "content"}}
+<div class="max-w-3xl mx-auto">
+    <a href="/tools/docgen" class="text-sm text-blue-600 hover:text-blue-800 mb-4 inline-block">&larr; Nueva plantilla</a>
+
+    <div class="bg-white rounded-lg border border-gray-200 p-6 mb-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-4">Marcadores detectados</h2>
+        <p class="text-sm text-gray-500 mb-3">Haz clic en un marcador para usarlo como nombre de archivo (verde = sí, azul = no)</p>
+        <div class="flex flex-wrap gap-2">
+            {{range .Data.Markers}}
+            <button class="inline-flex items-center px-3 py-1.5 rounded-full text-sm font-medium transition cursor-pointer {{if .IsFile}}bg-green-100 text-green-800 hover:bg-green-200{{else}}bg-blue-100 text-blue-800 hover:bg-blue-200{{end}}"
+                    hx-post="/tools/docgen/{{$.Data.ID}}/filename-markers"
+                    hx-vals='{"marker": "{{.Name}}"}'
+                    hx-headers='{"X-CSRF-Token": "{{$.CSRFToken}}"}'
+                    hx-trigger="click"
+                    hx-swap="none">
+                {{"{{"}}{{.Name}}{{"}}"}}
+            </button>
+            {{end}}
+        </div>
+    </div>
+
+    <div class="bg-white rounded-lg border border-gray-200 p-6 mb-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-4">Descargar plantilla Excel</h2>
+        <p class="text-sm text-gray-500 mb-3">Completa los datos en el Excel y súbelo de vuelta para generar los documentos.</p>
+        <a href="/tools/docgen/{{.Data.ID}}/template.xlsx" class="inline-flex items-center px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition text-sm font-medium">
+            Descargar plantilla.xlsx
+        </a>
+    </div>
+
+    <div class="bg-white rounded-lg border border-gray-200 p-6 mb-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-4">Subir datos</h2>
+        <form method="post" action="/tools/docgen/{{.Data.ID}}/data" enctype="multipart/form-data" class="space-y-4">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <div>
+                <label class="block text-sm font-medium text-gray-700">Excel con datos</label>
+                <input type="file" name="excel" accept=".xlsx" required class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+            </div>
+            <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition text-sm font-medium">
+                Subir Excel
+            </button>
+        </form>
+    </div>
+
+    {{if .Data.HasData}}
+    <div class="bg-white rounded-lg border border-gray-200 p-6 mb-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-4">Vista previa ({{len .Data.DataRows}} registros)</h2>
+        <div class="overflow-x-auto">
+            <table class="min-w-full text-sm">
+                <thead>
+                    <tr class="bg-gray-50">
+                        {{range .Data.Headers}}
+                        <th class="px-3 py-2 text-left font-medium text-gray-600 border-b">{{.}}</th>
+                        {{end}}
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range $i, $row := .Data.DataRows}}
+                    <tr class="hover:bg-gray-50">
+                        {{range $.Data.Headers}}
+                        <td class="px-3 py-2 border-b text-gray-700">{{index $row .}}</td>
+                        {{end}}
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-lg border border-green-200 p-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-2">Pago único — $2.990 CLP</h2>
+        <p class="text-sm text-gray-500 mb-4">Una vez que pagues, recibirás el ZIP con todos tus documentos generados.</p>
+        <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <button type="submit" class="w-full py-3 px-6 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition text-lg">
+                Pagar $2.990 y Descargar
+            </button>
+        </form>
+    </div>
+    {{end}}
+</div>
+{{end}}

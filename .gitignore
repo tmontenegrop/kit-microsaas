@@ -1,0 +1,6 @@
+data/
+storage/downloads/
+storage/uploads/
+*.exe
+*.test
+*.out
