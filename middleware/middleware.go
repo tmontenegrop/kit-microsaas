@@ -19,7 +19,7 @@ func Recovery(next http.Handler) http.Handler {
 					return
 				}
 				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Error</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-50 min-h-screen flex items-center justify-center"><div class="text-center max-w-md mx-auto px-4"><h1 class="text-6xl font-bold text-gray-300 mb-4">500</h1><p class="text-xl text-gray-600 mb-8">Error interno del servidor</p><p class="text-gray-500 mb-8">Ocurrió un error inesperado. Intenta nuevamente más tarde.</p><a href="/" class="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700">Volver al inicio</a></div></body></html>`))
+				_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Error</title><link rel="stylesheet" href="/static/tailwind.css"></head><body class="bg-gray-50 min-h-screen flex items-center justify-center"><div class="text-center max-w-md mx-auto px-4"><h1 class="text-6xl font-bold text-gray-300 mb-4">500</h1><p class="text-xl text-gray-600 mb-8">Error interno del servidor</p><p class="text-gray-500 mb-8">Ocurrio un error inesperado. Intenta nuevamente mas tarde.</p><a href="/" class="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700">Volver al inicio</a></div></body></html>`))
 			}
 		}()
 		next.ServeHTTP(w, r)

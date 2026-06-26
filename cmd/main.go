@@ -44,6 +44,8 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./static"))))
+
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		tmpl.Render(w, r, "index", template.TemplateData{
 			Title: "Inicio",

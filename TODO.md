@@ -2,15 +2,15 @@
 
 ## Urgente (antes de producción)
 
-- [ ] Guardar download tokens hasheados — usar `token_hash` columna existente
-- [ ] Arreglar `ratelimit.Check()` — propagar errores de Commit
-- [ ] Hacer atómica la actualización payment+download en webhook
-- [ ] Arreglar `isRequestSecure()` para reverse proxy
-- [ ] Cleanup race condition — `UPDATE status='expired'` en vez de DELETE
+- [x] Guardar download tokens hasheados — usar `token_hash` columna existente
+- [x] Arreglar `ratelimit.Check()` — propagar errores de Commit
+- [x] Hacer atómica la actualización payment+download en webhook
+- [x] Arreglar `isRequestSecure()` para reverse proxy
+- [x] Cleanup race condition — `UPDATE status='expired'` en vez de DELETE
 
 ## Corto plazo
 
-- [ ] Compilar Tailwind a CSS estático, limpiar CSP
+- [x] Compilar Tailwind a CSS estático, limpiar CSP
 - [ ] Implementar creación de pago real en Flow.cl
 - [ ] Implementar webhook real con idempotencia
 - [ ] Health check endpoint

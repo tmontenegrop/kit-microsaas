@@ -186,7 +186,7 @@ CREATE TABLE idempotency_keys (
 | Concern | Implementation |
 |---------|---------------|
 | **CSRF** | Double Submit Cookie. HTMX sends `X-CSRF-Token` header via `hx-headers`. Exempt: `/webhook/flow`. |
-| **XSS** | Go `html/template` auto-escapes. CSP restricts script/style sources (CDN only). Added `unpkg.com` to CSP for HTMX. |
+| **XSS** | Go `html/template` auto-escapes. CSP allows only `'self'` + `unpkg.com` (HTMX). Tailwind compiled statically, no `unsafe-inline`. |
 | **SQL injection** | All queries use parameterized placeholders (`?`). No string concatenation. |
 | **Path traversal** | `storage.resolve()` normalizes path and checks `filepath.Rel` does not start with `..`. |
 | **File upload** | `SaveWithValidation()` reads into memory, checks `http.DetectContentType` against whitelist, enforces 10MB limit. |
@@ -194,7 +194,7 @@ CREATE TABLE idempotency_keys (
 | **Download token** | 64 random hex chars from `crypto/rand`. Stored hashed (SHA-256) as `token_hash`. 1h TTL (extendable). |
 | **Webhook HMAC** | Flow.cl signs requests with shared secret. `VerifyHMAC()` validates SHA-256 HMAC before processing. |
 | **Error leakage** | In production, all errors return generic "Error interno del servidor". Full error logged server-side only. |
-| **Security headers** | CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff, HSTS (1 year, preload), Referrer-Policy, Permissions-Policy. |
+| **Security headers** | CSP (no `unsafe-inline`, no CDN script sources), X-Frame-Options: DENY, X-Content-Type-Options: nosniff, HSTS (1 year, preload), Referrer-Policy, Permissions-Policy. |
 | **HTTPS** | Production only: redirects all HTTP to HTTPS (301). |
 | **CORS** | Configurable via `ALLOWED_ORIGINS` env var. Disabled by default (empty = no CORS header). |
 | **Cleanup** | Goroutine every 1h: expired downloads (draft/ready >24h) → status='expired', deletes upload files. |
@@ -207,7 +207,7 @@ CREATE TABLE idempotency_keys (
 - **Production**: Not deployed.
 - **Dev mode**: Pay handler bypasses Flow.cl, generates ZIP directly and serves download.
 - **HTMX**: Used for marker toggle (`HX-Refresh`), included via CDN (unpkg).
-- **Tailwind**: CDN via `cdn.tailwindcss.com`. In production should be compiled statically.
+- **Tailwind**: Compiled statically to `static/tailwind.css` (v4, served from `'self'`). No CDN dependency.
 - **excelize/v2**: Added for Excel template generation and data parsing.
 - **Roadmaps**: `roadmap-produccion.md` (high-level phases), `roadmap-detallado.md` (concrete tasks per file), `TODO.md` (quick checklist).
 - **Auditoria findings resolved**: 7 of 11 original findings fixed. Remaining: CSP cleanup, context.Context, template race, Flow.cl real integration.
@@ -218,6 +218,7 @@ CREATE TABLE idempotency_keys (
 2. **hx-vals enviaba JSON, handler esperaba form-urlencoded** — `hx-vals='{"marker": "{{.Name}}"}'` enviaba JSON pero `ToggleFileNameMarker` usa `r.FormValue("marker")` (form-urlencoded). Fix: `<form hx-post>` con hidden input.
 3. **generateAndServe sin transacción** — Dos `db.Exec()` separados para UPDATE download + INSERT payment. Fix: envuelto en `Begin()` / `Commit()`.
 4. **Webhook payment updates sin transacción** — Múltiples `db.Exec()` sin atomicidad. Fix: envuelto en transacción.
+5. **Tailwind CDN con `unsafe-inline`** — Tailwind desde CDN requería `'unsafe-inline'` en CSP. Fix: compilado a `static/tailwind.css` (v4), servido desde `'self'`. CSP limpiada.
 
 ## Hallazgos de auditoría ya corregidos
 

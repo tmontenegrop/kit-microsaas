@@ -8,7 +8,7 @@
 
 El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisiones arquitectónicas son coherentes, la superficie de ataque se redujo drásticamente al eliminar auth/email/roles, y los controles de seguridad básicos (CSRF, path traversal, parámetros preparados) están correctos.
 
-**Estado de hallazgos anteriores:** 7 de 11 hallazgos de la auditoría original ya están corregidos (token hasheado ✅, ratelimit commits ✅, isRequestSecure ✅, cleanup race condition ✅, cleanup atómico ✅, CSRF error logging ✅, CORS methods ✅). Quedan pendientes: CSP con CDN/unsafe-inline, context.Context en queries, template reload race condition, y flujo real de Flow.cl. Recomendación: corregir los pendientes 🟡 antes de producción.
+**Estado de hallazgos anteriores:** 8 de 11 hallazgos de la auditoría original ya están corregidos (token hasheado ✅, ratelimit commits ✅, isRequestSecure ✅, cleanup race condition ✅, cleanup atómico ✅, CSRF error logging ✅, CORS methods ✅, CSP/unsafe-inline ✅). Quedan pendientes: context.Context en queries, template reload race condition, y flujo real de Flow.cl. Recomendación: corregir los pendientes 🟡 antes de producción.
 
 ---
 
@@ -52,10 +52,11 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 - **Fix:** `slog.Error("csrf generate token", "error", err)` agregado en línea 77.
 - **Estado:** ✅ Corregido.
 
-**🟡 MEDIO — CSP depende de CDN de terceros con `unsafe-inline`**
-- **Dónde:** `middleware/security.go:10`
-- **Problema:** Tailwind CDN requiere `'unsafe-inline'` para scripts y estilos. Si el CDN es comprometido, puede inyectar código. Además, `'unsafe-inline'` anula parte de la protección CSP contra XSS.
-- **Recomendación:** Antes de producción, compilar Tailwind a un archivo `.css` estático y servirlo desde `'self'`. Remover `'unsafe-inline'` de la CSP y servir el JS mínimo necesario desde `'self'`.
+**🟡 MEDIO — CSP depende de CDN de terceros con `unsafe-inline` — ✅ CORREGIDO**
+- **Dónde:** `middleware/security.go:10`, `static/tailwind.css`
+- **Problema original:** Tailwind CDN requería `'unsafe-inline'` para scripts y estilos.
+- **Fix:** Tailwind compilado a `static/tailwind.css` (v4, minified, ~4KB), servido desde `'self'`. CSP ahora es: `default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self'; ...`. Sin `unsafe-inline`, sin CDN de Tailwind.
+- **Estado:** ✅ Corregido.
 
 **🔵 BAJO — CORS expone métodos PUT/DELETE — ✅ CORREGIDO**
 - **Dónde:** `middleware/security.go:60`
@@ -180,15 +181,21 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 - **Fix:** Cambiado a `<form hx-post=...>` con `<input type="hidden" name="marker" value="{{.Name}}">`. HTMX serializa el form como form-urlencoded automáticamente.
 - **Gravedad:** 🔴 CRÍTICO (funcionalidad de marcadores completamente rota)
 
+**🐛 Tailwind CDN con `unsafe-inline` — CORREGIDO**
+- **Dónde:** `middleware/security.go:10`, `views/layout.html:7`
+- **Problema:** Tailwind se cargaba desde CDN via `<script>`, lo que requería `'unsafe-inline'` en CSP y exponía a riesgo de XSS si el CDN era comprometido.
+- **Fix:** Tailwind compilado a `static/tailwind.css` (v4, ~4KB), servido desde `'self'`. CSP limpiada: sin `unsafe-inline`, sin CDN de Tailwind.
+- **Gravedad:** 🟡 MEDIO (riesgo de seguridad, no funcional)
+
 ---
 
 ## Top 3 acciones inmediatas antes de producción (pendientes)
 
-1. **🟡 CSP depende de CDN con `unsafe-inline`.** Compilar Tailwind a CSS estático, servirlo desde `'self'`, remover `'unsafe-inline'` de script-src y style-src.
+1. **🟡 No hay `context.Context` en queries SQL.** Migrar a `BeginTx`, `ExecContext`, `QueryRowContext` con `r.Context()` en handlers HTTP.
 
-2. **🟡 No hay `context.Context` en queries SQL.** Migrar a `BeginTx`, `ExecContext`, `QueryRowContext` con `r.Context()` en handlers HTTP.
+2. **🟡 Template reload race condition.** Agregar `sync.RWMutex` en `template.Engine` para proteger acceso concurrente a `e.templates`.
 
-3. **🟡 Template reload race condition.** Agregar `sync.RWMutex` en `template.Engine` para proteger acceso concurrente a `e.templates`.
+3. **🟠 Handler de pago real con Flow.cl.** Probar sandbox, ajustar parseo del webhook según documentación real.
 
 ---
 

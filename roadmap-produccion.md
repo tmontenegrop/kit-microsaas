@@ -4,18 +4,18 @@
 
 ## Fase 1 — Seguridad crítica (antes de abrir al público)
 
-| # | Tarea | Prioridad | Depende de |
-|---|-------|-----------|------------|
-| 1 | Guardar download tokens hasheados (`token_hash`) en vez de texto plano | 🔴 CRÍTICO | — |
-| 2 | Arreglar `ratelimit.Check()` — propagar errores de Commit | 🔴 CRÍTICO | — |
-| 3 | Hacer atómica la actualización payment+download en webhook | 🟠 ALTO | — |
-| 4 | Arreglar `isRequestSecure()` para reverse proxy | 🟠 ALTO | — |
-| 5 | Cleanup race condition: usar `UPDATE status='expired'` en vez de DELETE | 🟠 ALTO | — |
-| 6 | Compilar Tailwind a CSS estático, remover `unsafe-inline` de CSP | 🟠 ALTO | — |
-| 7 | Hacer cleanup de payments + downloads atómico (transacción) | 🟠 ALTO | — |
-| 8 | Loggear error si `crypto/rand` falla en CSRF token | 🟡 MEDIO | — |
-| 9 | Agregar TTL a `idempotency_keys` | 🟡 MEDIO | — |
-| 10 | Limitar CORS a GET, POST, OPTIONS | 🔵 BAJO | — |
+| # | Tarea | Prioridad | Estado |
+|---|-------|-----------|--------|
+| 1 | Guardar download tokens hasheados (`token_hash`) en vez de texto plano | 🔴 CRÍTICO | ✅ |
+| 2 | Arreglar `ratelimit.Check()` — propagar errores de Commit | 🔴 CRÍTICO | ✅ |
+| 3 | Hacer atómica la actualización payment+download en webhook | 🟠 ALTO | ✅ |
+| 4 | Arreglar `isRequestSecure()` para reverse proxy | 🟠 ALTO | ✅ |
+| 5 | Cleanup race condition: usar `UPDATE status='expired'` en vez de DELETE | 🟠 ALTO | ✅ |
+| 6 | Compilar Tailwind a CSS estático, remover `unsafe-inline` de CSP | 🟠 ALTO | ✅ |
+| 7 | Hacer cleanup de payments + downloads atómico (transacción) | 🟠 ALTO | ✅ |
+| 8 | Loggear error si `crypto/rand` falla en CSRF token | 🟡 MEDIO | ✅ |
+| 9 | Agregar TTL a `idempotency_keys` | 🟡 MEDIO | ✅ |
+| 10 | Limitar CORS a GET, POST, OPTIONS | 🔵 BAJO | ✅ |
 
 ## Fase 2 — Integración Flow.cl real
 

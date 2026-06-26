@@ -5,3 +5,5 @@ storage/uploads/
 *.test
 *.out
 server_*.log
+node_modules/
+static/input.css
