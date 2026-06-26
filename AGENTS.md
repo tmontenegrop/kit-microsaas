@@ -210,7 +210,12 @@ CREATE TABLE idempotency_keys (
 - **Tailwind**: Compiled statically to `static/tailwind.css` (v4, served from `'self'`). No CDN dependency.
 - **excelize/v2**: Added for Excel template generation and data parsing.
 - **Roadmaps**: `roadmap-produccion.md` (high-level phases), `roadmap-detallado.md` (concrete tasks per file), `TODO.md` (quick checklist).
-- **Auditoria findings resolved**: 7 of 11 original findings fixed. Remaining: CSP cleanup, context.Context, template race, Flow.cl real integration.
+- **Auditoria findings resolved**: 10 of 11 original findings fixed. Remaining: Flow.cl real integration.
+- **Context in queries**: All DB calls use `context.Context` (`QueryRowContext`, `ExecContext`, `BeginTx`).
+- **Health check**: `GET /health` returns `{"status":"ok"}` or `{"status":"unhealthy"}` (503).
+- **Data rows limit**: Max 1000 rows per Excel upload.
+- **Docker**: Multi-stage build (golang:1.25-alpine → alpine:3.21, pure Go, no CGO).
+- **Caddy**: Config file with rate limiting, security headers, logs.
 
 ## Bugs corregidos
 

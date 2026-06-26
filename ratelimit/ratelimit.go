@@ -1,17 +1,18 @@
 package ratelimit
 
 import (
+	"context"
 	"database/sql"
 	"time"
 )
 
 const timeFmt = "2006-01-02 15:04:05.000"
 
-func Check(db *sql.DB, key string, maxAttempts int, window time.Duration) (bool, error) {
+func Check(ctx context.Context, db *sql.DB, key string, maxAttempts int, window time.Duration) (bool, error) {
 	now := time.Now().UTC()
 	expiresAt := now.Add(window).Format(timeFmt)
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -64,6 +65,6 @@ func Check(db *sql.DB, key string, maxAttempts int, window time.Duration) (bool,
 	return true, nil
 }
 
-func Cleanup(db *sql.DB) {
-	_, _ = db.Exec("DELETE FROM rate_limits WHERE expires_at < ?", time.Now().UTC().Format(timeFmt))
+func Cleanup(ctx context.Context, db *sql.DB) {
+	_, _ = db.ExecContext(ctx, "DELETE FROM rate_limits WHERE expires_at < ?", time.Now().UTC().Format(timeFmt))
 }

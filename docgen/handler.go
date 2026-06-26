@@ -3,6 +3,7 @@ package docgen
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -81,7 +82,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	expiresAt := now.Add(1 * time.Hour).Format("2006-01-02 15:04:05")
 	markersJSON, _ := json.Marshal(markers)
 
-	_, err = h.DB.Exec(
+	_, err = h.DB.ExecContext(r.Context(),
 		`INSERT INTO downloads (id, tool_id, token, token_hash, status, ip_address, created_at, expires_at, file_path, markers, file_name_markers)
 		 VALUES (?, (SELECT id FROM tools WHERE slug = 'docgen'), ?, ?, 'draft', ?, ?, ?, ?, ?, '[]')`,
 		id, token, security.HashToken(token), r.RemoteAddr, now.Format("2006-01-02 15:04:05"), expiresAt,
@@ -101,7 +102,7 @@ func (h *Handler) Show(w http.ResponseWriter, r *http.Request) {
 
 	var status, markersStr, fileNameMarkersStr string
 	var dataRowsStr sql.NullString
-	err := h.DB.QueryRow(
+	err := 	h.DB.QueryRowContext(r.Context(),
 		"SELECT status, markers, file_name_markers, data_rows FROM downloads WHERE id = ?", id,
 	).Scan(&status, &markersStr, &fileNameMarkersStr, &dataRowsStr)
 	if err != nil {
@@ -156,7 +157,7 @@ func (h *Handler) Show(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DownloadTemplate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var markersStr string
-	err := h.DB.QueryRow("SELECT markers FROM downloads WHERE id = ?", id).Scan(&markersStr)
+	err := 	h.DB.QueryRowContext(r.Context(),"SELECT markers FROM downloads WHERE id = ?", id).Scan(&markersStr)
 	if err != nil {
 		http.Error(w, "No encontrada", http.StatusNotFound)
 		return
@@ -183,7 +184,7 @@ func (h *Handler) ToggleFileNameMarker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var fileNameMarkersStr string
-	err := h.DB.QueryRow("SELECT file_name_markers FROM downloads WHERE id = ?", id).Scan(&fileNameMarkersStr)
+	err := 	h.DB.QueryRowContext(r.Context(),"SELECT file_name_markers FROM downloads WHERE id = ?", id).Scan(&fileNameMarkersStr)
 	if err != nil {
 		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
@@ -205,7 +206,7 @@ func (h *Handler) ToggleFileNameMarker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated, _ := json.Marshal(markers)
-	h.DB.Exec("UPDATE downloads SET file_name_markers = ? WHERE id = ?", string(updated), id)
+	h.DB.ExecContext(r.Context(),"UPDATE downloads SET file_name_markers = ? WHERE id = ?", string(updated), id)
 
 	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusOK)
@@ -215,7 +216,7 @@ func (h *Handler) DataUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var status, markersStr string
-	err := h.DB.QueryRow("SELECT status, markers FROM downloads WHERE id = ?", id).Scan(&status, &markersStr)
+	err := 	h.DB.QueryRowContext(r.Context(),"SELECT status, markers FROM downloads WHERE id = ?", id).Scan(&status, &markersStr)
 	if err != nil {
 		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
@@ -282,8 +283,13 @@ func (h *Handler) DataUpload(w http.ResponseWriter, r *http.Request) {
 		dataRows = append(dataRows, row)
 	}
 
+	if len(dataRows) > 1000 {
+		http.Error(w, "Maximo 1000 filas por archivo", http.StatusBadRequest)
+		return
+	}
+
 	dataRowsJSON, _ := json.Marshal(dataRows)
-	h.DB.Exec("UPDATE downloads SET data_rows = ?, status = 'ready' WHERE id = ?", string(dataRowsJSON), id)
+	h.DB.ExecContext(r.Context(),"UPDATE downloads SET data_rows = ?, status = 'ready' WHERE id = ?", string(dataRowsJSON), id)
 
 	http.Redirect(w, r, "/tools/docgen/"+id, http.StatusSeeOther)
 }
@@ -292,7 +298,7 @@ func (h *Handler) Pay(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var status, token string
-	err := h.DB.QueryRow("SELECT status, token FROM downloads WHERE id = ?", id).Scan(&status, &token)
+	err := 	h.DB.QueryRowContext(r.Context(),"SELECT status, token FROM downloads WHERE id = ?", id).Scan(&status, &token)
 	if err != nil {
 		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
@@ -303,7 +309,7 @@ func (h *Handler) Pay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.Config.IsDevelopment() {
-		h.generateAndServe(id, token)
+		h.generateAndServe(r.Context(), id, token)
 		http.Redirect(w, r, "/download/"+token, http.StatusSeeOther)
 		return
 	}
@@ -320,7 +326,7 @@ func (h *Handler) Pay(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 	var status, id string
-	err := h.DB.QueryRow("SELECT id, status FROM downloads WHERE token_hash = ?", security.HashToken(token)).Scan(&id, &status)
+	err := 	h.DB.QueryRowContext(r.Context(),"SELECT id, status FROM downloads WHERE token_hash = ?", security.HashToken(token)).Scan(&id, &status)
 	if err != nil {
 		h.Tmpl.Render(w, r, "tools/docgen", template.TemplateData{Title: "No encontrado"})
 		return
@@ -336,7 +342,7 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	tokenHash := security.HashToken(token)
 
 	var id, filePath, status string
-	err := h.DB.QueryRow("SELECT id, file_path, status FROM downloads WHERE token_hash = ?", tokenHash).Scan(&id, &filePath, &status)
+	err := 	h.DB.QueryRowContext(r.Context(),"SELECT id, file_path, status FROM downloads WHERE token_hash = ?", tokenHash).Scan(&id, &filePath, &status)
 	if err != nil {
 		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
@@ -383,7 +389,7 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 	tokenHash := security.HashToken(token)
 
 	var downloadID string
-	err := h.DB.QueryRow(
+	err := 	h.DB.QueryRowContext(r.Context(),
 		"SELECT id FROM downloads WHERE token_hash = ? AND status = 'ready'", tokenHash,
 	).Scan(&downloadID)
 	if err != nil {
@@ -391,16 +397,16 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.generateAndServe(downloadID, token)
+	h.generateAndServe(r.Context(), downloadID, token)
 
-	tx, err := h.DB.Begin()
+	tx, err := h.DB.BeginTx(r.Context(), nil)
 	if err != nil {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	defer tx.Rollback()
 
-	tx.Exec("UPDATE payments SET flow_token = ? WHERE download_id = ?", data.Token, downloadID)
+	tx.ExecContext(r.Context(), "UPDATE payments SET flow_token = ? WHERE download_id = ?", data.Token, downloadID)
 
 	if err := tx.Commit(); err != nil {
 		w.WriteHeader(http.StatusOK)
@@ -410,10 +416,10 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *Handler) generateAndServe(id, token string) {
+func (h *Handler) generateAndServe(ctx context.Context, id, token string) {
 	var docxPath, markersStr, fileNameMarkersStr string
 	var dataRowsStr sql.NullString
-	err := h.DB.QueryRow(
+	err := h.DB.QueryRowContext(ctx,
 		"SELECT file_path, markers, file_name_markers, data_rows FROM downloads WHERE id = ?", id,
 	).Scan(&docxPath, &markersStr, &fileNameMarkersStr, &dataRowsStr)
 	if err != nil || !dataRowsStr.Valid {
@@ -439,17 +445,17 @@ func (h *Handler) generateAndServe(id, token string) {
 		return
 	}
 
-	tx, err := h.DB.Begin()
+	tx, err := h.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec("UPDATE downloads SET status = 'paid', paid_at = datetime('now'), file_path = ? WHERE id = ?", zipPath, id)
+	_, err = tx.ExecContext(ctx, "UPDATE downloads SET status = 'paid', paid_at = datetime('now'), file_path = ? WHERE id = ?", zipPath, id)
 	if err != nil {
 		return
 	}
-	_, err = tx.Exec("INSERT INTO payments (id, download_id, amount, status) VALUES (?, ?, 2990, 'confirmed')", security.GenerateID(), id)
+	_, err = tx.ExecContext(ctx, "INSERT INTO payments (id, download_id, amount, status) VALUES (?, ?, 2990, 'confirmed')", security.GenerateID(), id)
 	if err != nil {
 		return
 	}

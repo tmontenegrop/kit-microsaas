@@ -8,7 +8,7 @@
 
 El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisiones arquitectónicas son coherentes, la superficie de ataque se redujo drásticamente al eliminar auth/email/roles, y los controles de seguridad básicos (CSRF, path traversal, parámetros preparados) están correctos.
 
-**Estado de hallazgos anteriores:** 8 de 11 hallazgos de la auditoría original ya están corregidos (token hasheado ✅, ratelimit commits ✅, isRequestSecure ✅, cleanup race condition ✅, cleanup atómico ✅, CSRF error logging ✅, CORS methods ✅, CSP/unsafe-inline ✅). Quedan pendientes: context.Context en queries, template reload race condition, y flujo real de Flow.cl. Recomendación: corregir los pendientes 🟡 antes de producción.
+**Estado de hallazgos anteriores:** 10 de 11 hallazgos de la auditoría original ya están corregidos (token hasheado ✅, ratelimit commits ✅, isRequestSecure ✅, cleanup race condition ✅, cleanup atómico ✅, CSRF error logging ✅, CORS methods ✅, CSP/unsafe-inline ✅, context.Context en queries ✅, template reload race condition ✅). Queda pendiente: integración real con Flow.cl.
 
 ---
 
@@ -77,32 +77,15 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 **🟠 ALTO — Rate limit puede dar falso positivo por error de Commit — ✅ CORREGIDO**
 - **(Ya documentado en D1, corregido)**
 
-**🟠 ALTO — No hay `context.Context` en ninguna query SQL**
-- **Dónde:** Todos los archivos .go
-- **Problema:** Ninguna llamada a `db.Conn.QueryRow`, `db.Conn.Exec`, `db.Conn.Begin` usa `context.Context`. Si el cliente cierra la conexión, la query sigue ejecutándose. En SQLite con WAL mode no es crítico, pero es mala práctica.
-- **Recomendación:** Migrar a `db.Conn.BeginTx(ctx, nil)`, `db.Conn.ExecContext(ctx, ...)`, etc.
-  ```go
-  func Check(ctx context.Context, db *sql.DB, key string, maxAttempts int, window time.Duration) (bool, error) {
-      tx, err := db.BeginTx(ctx, nil)
-  ```
+**🟠 ALTO — No hay `context.Context` en ninguna query SQL — ✅ CORREGIDO**
+- **Dónde:** `handler.go`, `cleanup.go`, `ratelimit.go`, `main.go`
+- **Problema original:** Ninguna llamada SQL usaba context.
+- **Fix:** Todas las queries migradas a `QueryRowContext`, `ExecContext`, `BeginTx`, `QueryContext`. Handlers HTTP usan `r.Context()`, goroutines usan `context.Background()`.
 
-**🟡 MEDIO — Race condition en template reload mode**
-- **Dónde:** `template/template.go:78-81`
-- **Problema:** En desarrollo (`reload=true`), `loadTemplates()` reasigna `e.templates` mientras `Render()` lo lee. Sin mutex. Dos requests paralelos pueden causar panic en lectura/escritura concurrente de map.
-- **Evidencia:** `loadTemplates()` (línea 148) escribe `e.templates = make(...)`. `Render()` (línea 85) lee `e.templates[name]`. Sin sincronización.
-- **Recomendación:**
-  ```go
-  var mu sync.RWMutex
-  func (e *Engine) Render(...) {
-      if e.reload {
-          mu.Lock()
-          e.loadTemplates()
-          mu.Unlock()
-      }
-      mu.RLock()
-      tmpl, ok := e.templates[name]
-      mu.RUnlock()
-  ```
+**🟡 MEDIO — Race condition en template reload mode — ✅ CORREGIDO**
+- **Dónde:** `template/template.go:27`
+- **Problema original:** Acceso concurrente a `e.templates` sin sincronización.
+- **Fix:** `Engine` tiene `sync.RWMutex`. `Render()`, `RenderFragment()`, `RenderString()` usan `mu.Lock()` para recarga y `mu.RLock()` para lectura.
 
 **⚪ INFO — Duplicación de lógica: cleanup de rate limits — ✅ CORREGIDO**
 - **Dónde:** `cleanup/cleanup.go:24`
@@ -189,13 +172,13 @@ El kit es sorprendentemente bueno para un proyecto generado por LLM: las decisio
 
 ---
 
-## Top 3 acciones inmediatas antes de producción (pendientes)
+## Top acciones pendientes
 
-1. **🟡 No hay `context.Context` en queries SQL.** Migrar a `BeginTx`, `ExecContext`, `QueryRowContext` con `r.Context()` en handlers HTTP.
+1. **🟠 Handler de pago real con Flow.cl.** Probar sandbox, ajustar parseo del webhook según documentación real.
 
-2. **🟡 Template reload race condition.** Agregar `sync.RWMutex` en `template.Engine` para proteger acceso concurrente a `e.templates`.
+2. **🟡 Tests automatizados.** Sin tests, cualquier refactor es riesgoso.
 
-3. **🟠 Handler de pago real con Flow.cl.** Probar sandbox, ajustar parseo del webhook según documentación real.
+3. **🟡 CI/CD.** Automatizar build + deploy on push a main.
 
 ---
 

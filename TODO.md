@@ -1,31 +1,30 @@
 # TODO kit-microsaas
 
-## Urgente (antes de producción)
+## Seguridad (todo listo ✅)
 
-- [x] Guardar download tokens hasheados — usar `token_hash` columna existente
-- [x] Arreglar `ratelimit.Check()` — propagar errores de Commit
-- [x] Hacer atómica la actualización payment+download en webhook
-- [x] Arreglar `isRequestSecure()` para reverse proxy
-- [x] Cleanup race condition — `UPDATE status='expired'` en vez de DELETE
+| Hallazgo | Estado |
+|----------|--------|
+| Download tokens hasheados | ✅ |
+| ratelimit.Check() propaga errores | ✅ |
+| Payment+download atómico | ✅ |
+| isRequestSecure() para proxy | ✅ |
+| Cleanup race condition | ✅ |
+| Tailwind estático + CSP sin unsafe-inline | ✅ |
+| CORS methods limitados | ✅ |
+| CSRF error logging | ✅ |
+| TTL en idempotency_keys | ✅ |
+| context.Context en queries SQL | ✅ |
+| Template reload race condition (mutex) | ✅ |
 
-## Corto plazo
+## Pendiente (antes de producción)
 
-- [x] Compilar Tailwind a CSS estático, limpiar CSP
-- [ ] Implementar creación de pago real en Flow.cl
-- [ ] Implementar webhook real con idempotencia
-- [ ] Health check endpoint
-- [ ] Dockerizar la app
-
-## Mediano plazo
-
-- [ ] Context en todas las queries SQL
-- [ ] Mutex en template reload mode
-- [ ] Backup automático de SQLite
-- [ ] Endpoint de polling `/status/{token}`
-- [ ] Soft-delete de tokens de descarga
-
-## Largo plazo
-
+- [ ] Handler de pago real con Flow.cl (probar sandbox)
+- [ ] Tests automatizados
 - [ ] CI/CD
+
+## Deseable
+
+- [ ] Backup automático de SQLite
+- [ ] Soft-delete de tokens de descarga
 - [ ] Segunda herramienta
 - [ ] Métricas y dashboard admin

@@ -1,0 +1,28 @@
+# Caddyfile — reverse proxy for kit-microsaas
+# Replace docgen.kit.app with your domain
+
+docgen.kit.app {
+    reverse_proxy localhost:8090 {
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Security headers (app also sets them, but defense in depth)
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # Rate limiting at proxy level
+    rate_limit {
+        zone dynamic {
+            key {remote_host}
+            events 20
+            window 1m
+        }
+    }
+
+    log {
+        output file /var/log/caddy/kit-microsaas.log
+    }
+}

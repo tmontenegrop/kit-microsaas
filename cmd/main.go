@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -45,6 +46,19 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./static"))))
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		err := db.Conn.PingContext(r.Context())
+		status := "ok"
+		code := http.StatusOK
+		if err != nil {
+			status = "unhealthy"
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	})
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		tmpl.Render(w, r, "index", template.TemplateData{
