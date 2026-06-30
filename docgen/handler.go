@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/tmontenegrop/kit-microsaas/config"
 	"github.com/tmontenegrop/kit-microsaas/db"
+	"github.com/tmontenegrop/kit-microsaas/ratelimit"
 	"github.com/tmontenegrop/kit-microsaas/security"
 	"github.com/tmontenegrop/kit-microsaas/template"
 )
@@ -34,7 +36,110 @@ func NewHandler(cfg *config.Config, tmpl *template.Engine) *Handler {
 	return &Handler{Config: cfg, DB: db.Conn, Tmpl: tmpl}
 }
 
+const (
+	passPrice      = 6990
+	trialMaxDocs   = 30
+	trialWindowDays = 30
+)
+
+func (h *Handler) trialKey(ip string) string {
+	return "trial:" + ip
+}
+
+func (h *Handler) passKey(ip string) string {
+	return "pass:" + ip
+}
+
+func (h *Handler) getTrialInfo(ctx context.Context, ip string) (remaining int, passActive bool, passExpiresAt string, err error) {
+	var docCount int
+	var windowStart string
+	err = h.DB.QueryRowContext(ctx,
+		"SELECT doc_count, window_start FROM trial_tracking WHERE key = ?", h.trialKey(ip),
+	).Scan(&docCount, &windowStart)
+	if err == sql.ErrNoRows {
+		remaining = trialMaxDocs
+	} else if err != nil {
+		return 0, false, "", err
+	} else {
+		ws, parseErr := time.Parse("2006-01-02 15:04:05", windowStart)
+		if parseErr != nil || time.Since(ws) > trialWindowDays*24*time.Hour {
+			remaining = trialMaxDocs
+		} else {
+			remaining = trialMaxDocs - docCount
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
+	}
+
+	var passExpires string
+	err = h.DB.QueryRowContext(ctx,
+		"SELECT expires_at FROM trial_tracking WHERE key = ? AND expires_at IS NOT NULL AND expires_at > datetime('now')",
+		h.passKey(ip),
+	).Scan(&passExpires)
+	if err == sql.ErrNoRows {
+		return remaining, false, "", nil
+	}
+	if err != nil {
+		return remaining, false, "", nil
+	}
+	return remaining, true, passExpires, nil
+}
+
+func (h *Handler) recordTrialUsage(ctx context.Context, ip string, docCount int) error {
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	_, err := h.DB.ExecContext(ctx, `
+		INSERT INTO trial_tracking (key, doc_count, window_start)
+		VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			doc_count = CASE
+				WHEN window_start < datetime('now', '-30 days') THEN ?
+				ELSE doc_count + ?
+			END,
+			window_start = CASE
+				WHEN window_start < datetime('now', '-30 days') THEN ?
+				ELSE window_start
+			END
+	`, h.trialKey(ip), docCount, now, docCount, docCount, now)
+	return err
+}
+
+func (h *Handler) recordPass(ctx context.Context, ip string, expiresAt time.Time) error {
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	exp := expiresAt.Format("2006-01-02 15:04:05")
+	_, err := h.DB.ExecContext(ctx, `
+		INSERT INTO trial_tracking (key, doc_count, window_start, expires_at)
+		VALUES (?, 0, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			expires_at = ?,
+			window_start = ?
+	`, h.passKey(ip), now, exp, exp, now)
+	return err
+}
+
 func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
+	allowed, err := ratelimit.Check(r.Context(), h.DB, "upload:"+r.RemoteAddr, 10, 1*time.Hour)
+	if err != nil {
+		http.Error(w, "Error interno", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "Demasiadas solicitudes. Intenta de nuevo mas tarde.", http.StatusTooManyRequests)
+		return
+	}
+
+	if _, err := r.Cookie("device_id"); err != nil {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "device_id",
+			Value:    security.GenerateID(),
+			Path:     "/",
+			MaxAge:   365 * 24 * 3600,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   h.Config.IsProduction(),
+		})
+	}
+
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "Error al leer formulario", http.StatusBadRequest)
 		return
@@ -60,7 +165,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	markers, err := extractMarkersBytes(docxBytes)
 	if err != nil {
-		http.Error(w, "Error al leer plantilla: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Plantilla invalida o sin marcadores {{...}}", http.StatusBadRequest)
 		return
 	}
 
@@ -100,11 +205,11 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Show(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	var status, markersStr, fileNameMarkersStr string
+	var status, markersStr, fileNameMarkersStr, ipAddress string
 	var dataRowsStr sql.NullString
 	err := 	h.DB.QueryRowContext(r.Context(),
-		"SELECT status, markers, file_name_markers, data_rows FROM downloads WHERE id = ?", id,
-	).Scan(&status, &markersStr, &fileNameMarkersStr, &dataRowsStr)
+		"SELECT status, markers, file_name_markers, data_rows, ip_address FROM downloads WHERE id = ?", id,
+	).Scan(&status, &markersStr, &fileNameMarkersStr, &dataRowsStr, &ipAddress)
 	if err != nil {
 		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
@@ -140,16 +245,35 @@ func (h *Handler) Show(w http.ResponseWriter, r *http.Request) {
 		headers = markers
 	}
 
+	trialRemaining, passActive, passExpires, _ := h.getTrialInfo(r.Context(), ipAddress)
+
+	var batchPrice int
+	if err := h.DB.QueryRowContext(r.Context(), "SELECT price_clp FROM tools WHERE id = 'docgen'").Scan(&batchPrice); err != nil {
+		batchPrice = 2990
+	}
+
+	newDocCount := 0
+	if hasData {
+		newDocCount = len(dataRows)
+	}
+
 	h.Tmpl.Render(w, r, "tools/docgen-show", template.TemplateData{
 		Title: "Generador de Documentos",
 		Data: map[string]interface{}{
-			"ID":             id,
-			"Status":         status,
-			"Markers":        markerItems,
-			"Headers":        headers,
-			"DataRows":       dataRows,
-			"HasData":        hasData,
-			"IdempotencyKey": security.GenerateID(),
+			"ID":              id,
+			"Status":          status,
+			"Markers":         markerItems,
+			"Headers":         headers,
+			"DataRows":        dataRows,
+			"HasData":         hasData,
+			"TrialRemaining":  trialRemaining,
+			"PassActive":      passActive,
+			"PassExpires":     passExpires,
+			"BatchPrice":      batchPrice,
+			"PassPrice":       passPrice,
+			"NewDocCount":     newDocCount,
+			"CanUseFreeTrial": trialRemaining >= newDocCount && trialRemaining > 0,
+			"IdempotencyKey":  security.GenerateID(),
 		},
 	})
 }
@@ -215,6 +339,14 @@ func (h *Handler) ToggleFileNameMarker(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DataUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	if allowed, err := ratelimit.Check(r.Context(), h.DB, "data:"+r.RemoteAddr, 20, 1*time.Hour); err != nil {
+		http.Error(w, "Error interno", http.StatusInternalServerError)
+		return
+	} else if !allowed {
+		http.Error(w, "Demasiadas solicitudes. Intenta de nuevo mas tarde.", http.StatusTooManyRequests)
+		return
+	}
+
 	var status, markersStr string
 	err := 	h.DB.QueryRowContext(r.Context(),"SELECT status, markers FROM downloads WHERE id = ?", id).Scan(&status, &markersStr)
 	if err != nil {
@@ -249,7 +381,13 @@ func (h *Handler) DataUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := xlsx.GetRows("Sheet1")
+	sheets := xlsx.GetSheetList()
+	if len(sheets) == 0 {
+		http.Error(w, "El Excel no contiene hojas", http.StatusBadRequest)
+		return
+	}
+	sheetName := sheets[0]
+	rows, err := xlsx.GetRows(sheetName)
 	if err != nil || len(rows) < 2 {
 		http.Error(w, "El Excel debe tener encabezados + al menos 1 fila de datos", http.StatusBadRequest)
 		return
@@ -283,52 +421,137 @@ func (h *Handler) DataUpload(w http.ResponseWriter, r *http.Request) {
 		dataRows = append(dataRows, row)
 	}
 
-	if len(dataRows) > 1000 {
-		http.Error(w, "Maximo 1000 filas por archivo", http.StatusBadRequest)
+	if len(dataRows) > 300 {
+		http.Error(w, "Maximo 300 filas por archivo", http.StatusBadRequest)
 		return
 	}
 
 	dataRowsJSON, _ := json.Marshal(dataRows)
-	h.DB.ExecContext(r.Context(),"UPDATE downloads SET data_rows = ?, status = 'ready' WHERE id = ?", string(dataRowsJSON), id)
+	if _, err := h.DB.ExecContext(r.Context(),"UPDATE downloads SET data_rows = ?, status = 'ready' WHERE id = ?", string(dataRowsJSON), id); err != nil {
+		http.Error(w, "Error interno", http.StatusInternalServerError)
+		return
+	}
 
 	http.Redirect(w, r, "/tools/docgen/"+id, http.StatusSeeOther)
 }
 
 func (h *Handler) Pay(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	plan := r.FormValue("plan")
 
-	var status, token string
-	err := 	h.DB.QueryRowContext(r.Context(),"SELECT status, token FROM downloads WHERE id = ?", id).Scan(&status, &token)
+	if allowed, err := ratelimit.Check(r.Context(), h.DB, "pay:"+r.RemoteAddr, 10, 1*time.Hour); err != nil {
+		http.Error(w, "Error interno", http.StatusInternalServerError)
+		return
+	} else if !allowed {
+		http.Error(w, "Demasiadas solicitudes. Intenta de nuevo mas tarde.", http.StatusTooManyRequests)
+		return
+	}
+
+	// Idempotency check
+	idk := r.FormValue("idempotency_key")
+	if idk != "" {
+		var exists int
+		err := h.DB.QueryRowContext(r.Context(),
+			"SELECT 1 FROM idempotency_keys WHERE key = ? AND expires_at > datetime('now')", "pay:"+idk,
+		).Scan(&exists)
+		if err == nil {
+			http.Error(w, "Solicitud duplicada", http.StatusConflict)
+			return
+		}
+		h.DB.ExecContext(r.Context(),
+			"INSERT INTO idempotency_keys (key, expires_at) VALUES (?, datetime('now', '+1 hour')) ON CONFLICT(key) DO NOTHING",
+			"pay:"+idk,
+		)
+	}
+
+	var status, token, ipAddress string
+	var dataRowsStr sql.NullString
+	err := h.DB.QueryRowContext(r.Context(),
+		"SELECT status, token, ip_address, data_rows FROM downloads WHERE id = ?", id,
+	).Scan(&status, &token, &ipAddress, &dataRowsStr)
 	if err != nil {
 		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
 	}
-	if status != "ready" {
-		http.Error(w, "Debes subir los datos antes de pagar", http.StatusBadRequest)
+	if status != "ready" || !dataRowsStr.Valid {
+		http.Error(w, "Debes subir los datos antes de continuar", http.StatusBadRequest)
 		return
 	}
 
-	if h.Config.IsDevelopment() {
-		h.generateAndServe(r.Context(), id, token)
+	var dataRows []map[string]string
+	json.Unmarshal([]byte(dataRowsStr.String), &dataRows)
+	docCount := len(dataRows)
+
+	switch plan {
+	case "free":
+		remaining, _, _, err := h.getTrialInfo(r.Context(), ipAddress)
+		if err != nil || remaining < docCount {
+			http.Error(w, "Has agotado tu prueba gratuita. Elige un plan de pago.", http.StatusPaymentRequired)
+			return
+		}
+		if err := h.recordTrialUsage(r.Context(), ipAddress, docCount); err != nil {
+			http.Error(w, "Error interno", http.StatusInternalServerError)
+			return
+		}
+			if err := h.generateAndServe(r.Context(), id, token, 0, ""); err != nil {
+			http.Error(w, "Error interno", http.StatusInternalServerError)
+			return
+		}
 		http.Redirect(w, r, "/download/"+token, http.StatusSeeOther)
-		return
-	}
 
-	flowURL, err := h.createFlowPayment(token)
-	if err != nil {
-		http.Error(w, "Error al iniciar pago", http.StatusInternalServerError)
-		return
-	}
+	case "pass":
+		if h.Config.IsDevelopment() {
+			if err := h.recordPass(r.Context(), ipAddress, time.Now().UTC().Add(30*24*time.Hour)); err != nil {
+				http.Error(w, "Error interno", http.StatusInternalServerError)
+				return
+			}
+			if err := h.generateAndServe(r.Context(), id, token, passPrice, ""); err != nil {
+				http.Error(w, "Error interno", http.StatusInternalServerError)
+				return
+			}
+			http.Redirect(w, r, "/download/"+token, http.StatusSeeOther)
+			return
+		}
+		flowURL, err := h.createFlowPayment(token, passPrice, "Pase 30 dias - DocGen")
+		if err != nil {
+			http.Error(w, "Error al iniciar pago", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, flowURL, http.StatusSeeOther)
 
-	http.Redirect(w, r, flowURL, http.StatusSeeOther)
+	default:
+		http.Error(w, "Plan invalido", http.StatusBadRequest)
+		return
+
+	case "batch":
+		var batchPrice int
+		err := h.DB.QueryRowContext(r.Context(), "SELECT price_clp FROM tools WHERE id = 'docgen'").Scan(&batchPrice)
+		if err != nil {
+			batchPrice = 2990
+		}
+		if h.Config.IsDevelopment() {
+			if err := h.generateAndServe(r.Context(), id, token, batchPrice, ""); err != nil {
+				http.Error(w, "Error interno", http.StatusInternalServerError)
+				return
+			}
+			http.Redirect(w, r, "/download/"+token, http.StatusSeeOther)
+			return
+		}
+		flowURL, err := h.createFlowPayment(token, batchPrice, "Batch - Generacion de Documentos")
+		if err != nil {
+			http.Error(w, "Error al iniciar pago", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, flowURL, http.StatusSeeOther)
+	}
 }
 
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 	var status, id string
-	err := 	h.DB.QueryRowContext(r.Context(),"SELECT id, status FROM downloads WHERE token_hash = ?", security.HashToken(token)).Scan(&id, &status)
+	err := h.DB.QueryRowContext(r.Context(), "SELECT id, status FROM downloads WHERE token_hash = ?", security.HashToken(token)).Scan(&id, &status)
 	if err != nil {
-		h.Tmpl.Render(w, r, "tools/docgen", template.TemplateData{Title: "No encontrado"})
+		http.Error(w, "No encontrado", http.StatusNotFound)
 		return
 	}
 	h.Tmpl.Render(w, r, "tools/status", template.TemplateData{
@@ -375,6 +598,7 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 	var data struct {
 		Token  string `json:"token"`
 		Status string `json:"status"`
+		Amount int    `json:"amount"`
 	}
 	if err := json.Unmarshal([]byte(body), &data); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -388,42 +612,46 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 
 	tokenHash := security.HashToken(token)
 
-	var downloadID string
-	err := 	h.DB.QueryRowContext(r.Context(),
-		"SELECT id FROM downloads WHERE token_hash = ? AND status = 'ready'", tokenHash,
-	).Scan(&downloadID)
+	var downloadID, ipAddress string
+	err := h.DB.QueryRowContext(r.Context(),
+		"SELECT id, ip_address FROM downloads WHERE token_hash = ? AND status = 'ready'", tokenHash,
+	).Scan(&downloadID, &ipAddress)
 	if err != nil {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	h.generateAndServe(r.Context(), downloadID, token)
+	amount := data.Amount
+	if amount <= 0 {
+		amount = 2990
+	}
 
-	tx, err := h.DB.BeginTx(r.Context(), nil)
-	if err != nil {
-		w.WriteHeader(http.StatusOK)
+	if err := h.generateAndServe(r.Context(), downloadID, token, amount, data.Token); err != nil {
+		slog.Error("webhook generateAndServe", "download_id", downloadID, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer tx.Rollback()
 
-	tx.ExecContext(r.Context(), "UPDATE payments SET flow_token = ? WHERE download_id = ?", data.Token, downloadID)
-
-	if err := tx.Commit(); err != nil {
-		w.WriteHeader(http.StatusOK)
-		return
+	if amount >= passPrice {
+		if err := h.recordPass(r.Context(), ipAddress, time.Now().UTC().Add(30*24*time.Hour)); err != nil {
+			slog.Error("webhook recordPass", "ip", ipAddress, "error", err)
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *Handler) generateAndServe(ctx context.Context, id, token string) {
+func (h *Handler) generateAndServe(ctx context.Context, id, token string, amount int, flowToken string) error {
 	var docxPath, markersStr, fileNameMarkersStr string
 	var dataRowsStr sql.NullString
 	err := h.DB.QueryRowContext(ctx,
 		"SELECT file_path, markers, file_name_markers, data_rows FROM downloads WHERE id = ?", id,
 	).Scan(&docxPath, &markersStr, &fileNameMarkersStr, &dataRowsStr)
-	if err != nil || !dataRowsStr.Valid {
-		return
+	if err != nil {
+		return fmt.Errorf("query download: %w", err)
+	}
+	if !dataRowsStr.Valid {
+		return fmt.Errorf("no data rows")
 	}
 
 	var markers []string
@@ -435,37 +663,39 @@ func (h *Handler) generateAndServe(ctx context.Context, id, token string) {
 
 	templateBytes, err := os.ReadFile(docxPath)
 	if err != nil {
-		return
+		return fmt.Errorf("read template: %w", err)
 	}
 
 	storeDir := filepath.Join(h.Config.StoragePath, "downloads", id)
-	os.MkdirAll(storeDir, 0755)
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
 	zipPath := filepath.Join(storeDir, "documentos.zip")
 	if err := generateZip(templateBytes, markers, fileNameMarkers, dataRows, zipPath); err != nil {
-		return
+		return fmt.Errorf("generate zip: %w", err)
 	}
 
 	tx, err := h.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, "UPDATE downloads SET status = 'paid', paid_at = datetime('now'), file_path = ? WHERE id = ?", zipPath, id)
-	if err != nil {
-		return
+	if _, err := tx.ExecContext(ctx, "UPDATE downloads SET status = 'paid', paid_at = datetime('now'), file_path = ? WHERE id = ?", zipPath, id); err != nil {
+		return fmt.Errorf("update download: %w", err)
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO payments (id, download_id, amount, status) VALUES (?, ?, 2990, 'confirmed')", security.GenerateID(), id)
-	if err != nil {
-		return
+	paymentID := security.GenerateID()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO payments (id, download_id, amount, status, flow_token) VALUES (?, ?, ?, 'confirmed', ?)", paymentID, id, amount, flowToken); err != nil {
+		return fmt.Errorf("insert payment: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return
+		return fmt.Errorf("commit: %w", err)
 	}
+	return nil
 }
 
-func (h *Handler) createFlowPayment(token string) (string, error) {
+func (h *Handler) createFlowPayment(token string, amount int, subject string) (string, error) {
 	parts := strings.SplitN(h.Config.FlowAPIKey, ":", 2)
 	if len(parts) != 2 {
 		return "", fmt.Errorf("invalid api key format")
@@ -476,9 +706,9 @@ func (h *Handler) createFlowPayment(token string) (string, error) {
 	vals := url.Values{
 		"apiKey":          {apiKey},
 		"commerceId":      {commerceID},
-		"subject":         {"DocGen - Generacion de Documentos"},
+		"subject":         {subject},
 		"currency":        {"CLP"},
-		"amount":          {"2990"},
+		"amount":          {fmt.Sprintf("%d", amount)},
 		"email":           {""},
 		"urlConfirmation": {h.Config.AppURL + "/webhook/flow"},
 		"urlReturn":       {h.Config.AppURL + "/status/" + token},

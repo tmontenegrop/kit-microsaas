@@ -65,14 +65,72 @@
     </div>
 
     <div class="bg-white rounded-lg border border-green-200 p-6">
-        <h2 class="text-lg font-semibold text-gray-900 mb-2">Pago único — $2.990 CLP</h2>
-        <p class="text-sm text-gray-500 mb-4">Una vez que pagues, recibirás el ZIP con todos tus documentos generados.</p>
+        <h2 class="text-lg font-semibold text-gray-900 mb-2">Generar documentos ({{.Data.NewDocCount}} archivos)</h2>
+
+        {{if .Data.PassActive}}
+        <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4 text-sm text-green-800">
+            Tienes un pase activo hasta {{.Data.PassExpires}}. Puedes generar sin costo adicional.
+        </div>
         <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
             <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-            <button type="submit" class="w-full py-3 px-6 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition text-lg">
-                Pagar $2.990 y Descargar
+            <input type="hidden" name="plan" value="pass">
+            <button type="submit" class="w-full py-3 px-6 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition text-lg">
+                Generar Documentos
             </button>
         </form>
+
+        {{else if .Data.CanUseFreeTrial}}
+        <p class="text-sm text-gray-500 mb-3">Te quedan <strong>{{.Data.TrialRemaining}}</strong> de 30 documentos gratis este mes.</p>
+        <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
+            <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+            <input type="hidden" name="plan" value="free">
+            <button type="submit" class="w-full py-3 px-6 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition text-lg">
+                Generar Gratis
+            </button>
+        </form>
+        <div class="mt-4 pt-4 border-t border-gray-200">
+            <p class="text-sm font-medium text-gray-700 mb-3">O elige un plan con más capacidad:</p>
+            <div class="grid grid-cols-2 gap-3">
+                <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
+                    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+                    <input type="hidden" name="plan" value="batch">
+                    <button type="submit" class="w-full py-2 px-4 border border-blue-600 text-blue-700 font-medium rounded-lg hover:bg-blue-50 transition text-sm">
+                        Batch — {{formatCLP .Data.BatchPrice}}
+                    </button>
+                </form>
+                <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
+                    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+                    <input type="hidden" name="plan" value="pass">
+                    <button type="submit" class="w-full py-2 px-4 border border-purple-600 text-purple-700 font-medium rounded-lg hover:bg-purple-50 transition text-sm">
+                        Pase 30 días — {{formatCLP .Data.PassPrice}}
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        {{else}}
+        <p class="text-sm text-orange-700 bg-orange-50 border border-orange-200 rounded-lg p-3 mb-4">
+            Has agotado tu prueba gratuita de 30 documentos.
+        </p>
+        <div class="grid grid-cols-2 gap-3">
+            <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
+                <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+                <input type="hidden" name="plan" value="batch">
+                <button type="submit" class="w-full py-3 px-4 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition">
+                    Batch — {{formatCLP .Data.BatchPrice}}
+                    <span class="block text-xs font-normal mt-1">Esta generación</span>
+                </button>
+            </form>
+            <form method="post" action="/tools/docgen/{{.Data.ID}}/pay">
+                <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+                <input type="hidden" name="plan" value="pass">
+                <button type="submit" class="w-full py-3 px-4 bg-purple-600 text-white font-semibold rounded-lg hover:bg-purple-700 transition">
+                    Pase 30 días — {{formatCLP .Data.PassPrice}}
+                    <span class="block text-xs font-normal mt-1">Ilimitado por 30 días</span>
+                </button>
+            </form>
+        </div>
+        {{end}}
     </div>
     {{end}}
 </div>

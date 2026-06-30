@@ -35,6 +35,9 @@ var migrationIdempotencyTTL string
 //go:embed migrations/k008_docgen_downloads.sql
 var migrationDocgenDownloads string
 
+//go:embed migrations/k010_trial_pass.sql
+var migrationTrialPass string
+
 var kitMigrations = []struct {
 	version string
 	sql     string
@@ -47,6 +50,7 @@ var kitMigrations = []struct {
 	{"k006_token_hash", migrationTokenHash},
 	{"k007_idempotency_ttl", migrationIdempotencyTTL},
 	{"k008_docgen_downloads", migrationDocgenDownloads},
+	{"k010_trial_pass", migrationTrialPass},
 }
 
 var Conn *sql.DB

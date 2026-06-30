@@ -143,6 +143,247 @@ if err != nil {
 
 ---
 
+## Fase 1b — Free trial + Planes (completada)
+
+### 11. Conectar `ratelimit.Check()` en Upload
+
+**Archivos:** `docgen/handler.go:Upload`
+
+**Qué hacer:**
+1. Llamar `ratelimit.Check(ctx, db.Conn, "upload:"+ip, 10, time.Hour)` al inicio de Upload
+2. Si blocked, responder con 429 y mensaje "Demasiadas solicitudes"
+3. Setear cookie `device_id` si no existe
+
+**Archivos modificados:** 1
+**Líneas:** ~15
+
+### 12. Migración `k010_trial_pass.sql`
+
+**Archivos:**
+- `db/migrations/k010_trial_pass.sql` — nueva migración
+- `db/db.go` — agregar a `kitMigrations`
+
+**Qué hacer:**
+```sql
+CREATE TABLE trial_tracking (
+    key         TEXT PRIMARY KEY,
+    doc_count   INTEGER NOT NULL DEFAULT 0,
+    window_start TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at  TEXT
+);
+```
+
+**Archivos modificados:** 2
+**Líneas:** ~15
+
+### 13. Free trial: `getTrialInfo()` + `recordTrialUsage()`
+
+**Archivos:** `docgen/handler.go`
+
+**Qué hacer:**
+1. `getTrialInfo(ctx, ip string)`:
+   - SELECT de `trial_tracking` WHERE `key = 'trial:' + ip`
+   - Si no existe: returns `{remaining: 30, windowStart: now}`
+   - Si `window_start + 30 days < now`: reset (UPDATE window_start = now, doc_count = 0)
+   - returns `{remaining: 30 - doc_count, canUseFree: remaining > 0}`
+2. `recordTrialUsage(ctx, ip string, count int)`:
+   - INSERT ON CONFLICT(key) DO UPDATE SET doc_count = doc_count + count
+
+**Archivos modificados:** 1
+**Líneas:** ~40
+
+### 14. Plan Batch ($2.990) + Plan Pase ($6.990)
+
+**Archivos:** `docgen/handler.go` (Pay, generateAndServe, createFlowPayment, Webhook)
+
+**Qué hacer:**
+1. Pay handler lee `plan` de `r.FormValue("plan")`:
+   - `"free"`: check trial → generate → recordTrialUsage
+   - `"batch"`: generate → insert payment (price_clp from DB)
+   - `"pass"`: generate → insert payment (6990) → recordPass (whitelist IP 30 days)
+2. `generateAndServe(amount)` — acepta amount como parámetro en vez de hardcode 2990
+3. `createFlowPayment(amount, subject)` — acepta amount + subject
+4. Webhook: si `amount >= 6990`, llama `recordPass(ip)`
+
+**Archivos modificados:** 1
+**Líneas:** ~100
+
+### 15. Pricing UI con 3 estados
+
+**Archivos:** `views/tools/docgen-show.html`
+
+**Qué hacer:**
+1. Estado PAS (pass activo): banner verde "Tienes pase activo hasta [fecha]", botón "Generar documentos"
+2. Estado TRIAL (trial disponible): banner azul con docs restantes + botones "Gratis (X docs)", "Batch $2.990", "Pase $6.990"
+3. Estado AGOTADO (trial vencido): banner rojo "Trial agotado", solo botones "Batch $2.990" y "Pase $6.990"
+4. Precios renderizados con `formatCLP`
+
+**Archivos modificados:** 1
+**Líneas:** ~50
+
+### 16. Límite 300 filas
+
+**Archivos:** `docgen/handler.go` — DataUpload
+
+**Qué hacer:** Cambiar de 1000 a 300 el máximo de filas de Excel.
+
+**Archivos modificados:** 1
+**Líneas:** 1
+
+### 17. Eliminar `k009_docgen_session.sql` leftover
+
+**Archivos:** `db/migrations/k009_docgen_session.sql` — eliminar archivo
+
+**Razón:** Era un ALTER TABLE de columnas que ya existen en k008. Causaría error en DB nueva.
+
+**Archivos modificados:** 1 eliminado
+
+---
+
+## Fase 1c — Segunda ronda auditoría (completada 30 jun 2026)
+
+### C1. generateAndServe retorna error
+
+**Archivos:** `docgen/handler.go`
+
+**Qué hacer:**
+- `generateAndServe()` ya no traga errores: todas las fallas (lectura template, ZIP, exec SQL) se retornan como `error`
+- El caller (Pay, Webhook) verifica el error y responde con 500 + log
+- `log/slog` importado en handler.go
+
+**Archivos modificados:** 1
+**Líneas:** ~30
+
+### C3. Webhook reordenado
+
+**Archivos:** `docgen/handler.go`
+
+**Qué hacer:**
+- Webhook ejecuta `generateAndServe()` primero (que genera ZIP + INSERT payment + UPDATE download en una tx)
+- Solo después registra el pass si `amount >= 6990`
+- Se eliminó la transacción separada para `flow_token` (integrada en generateAndServe)
+
+**Archivos modificados:** 1
+**Líneas:** ~15
+
+### H1. DataUpload verifica error de UPDATE
+
+**Archivos:** `docgen/handler.go:DataUpload`
+
+**Qué hacer:**
+- Verificar el error retornado por `ExecContext` después del UPDATE downloads SET data_rows
+- Si falla, responder 500
+
+**Archivos modificados:** 1
+**Líneas:** 4
+
+### H2. Show verifica batchPrice query error
+
+**Archivos:** `docgen/handler.go:Show`
+
+**Qué hacer:**
+- Cambiar `QueryRowContext(...).Scan(&batchPrice); if batchPrice == 0` por `if err := ...Scan(&batchPrice); err != nil { batchPrice = 2990 }`
+
+**Archivos modificados:** 1
+**Líneas:** 2
+
+### H3. recordTrialUsage antes de generateAndServe
+
+**Archivos:** `docgen/handler.go:Pay` (free case)
+
+**Qué hacer:**
+- Llamar `recordTrialUsage()` antes de `generateAndServe()` para asegurar que si el conteo falla, el ZIP no se genera sin descuento
+
+**Archivos modificados:** 1
+**Líneas:** 2
+
+### H4. Idempotencia en Pay
+
+**Archivos:** `docgen/handler.go:Pay`
+
+**Qué hacer:**
+- Al inicio de Pay, antes del switch de plan, leer `r.FormValue("idempotency_key")`
+- Consultar `idempotency_keys` con key `pay:{idk}`
+- Si existe la key, responder 409 "Solicitud duplicada"
+- Si no existe, proceder con el pago
+
+**Archivos modificados:** 1
+**Líneas:** ~15
+
+### M2. Status endpoint 404
+
+**Archivos:** `docgen/handler.go:Status`
+
+**Qué hacer:**
+- Si el token no existe en DB, responder `http.Error(w, "No encontrado", 404)` en vez de renderizar template incorrecto
+
+**Archivos modificados:** 1
+**Líneas:** 2
+
+### M3. Rate limit en DataUpload y Pay
+
+**Archivos:** `docgen/handler.go`
+
+**Qué hacer:**
+- DataUpload: `ratelimit.Check(ctx, db, "data:"+ip, 20, 1h)`
+- Pay: `ratelimit.Check(ctx, db, "pay:"+ip, 10, 1h)`
+- Ambos retornan 429 si se excede el límite
+
+**Archivos modificados:** 1
+**Líneas:** ~16
+
+### B1. No exponer paths en Upload error
+
+**Archivos:** `docgen/handler.go:Upload`
+
+**Qué hacer:**
+- Cambiar `"Error al leer plantilla: "+err.Error()` por mensaje genérico "Plantilla invalida o sin marcadores {{...}}"
+
+**Archivos modificados:** 1
+**Líneas:** 1
+
+### B2. CSP remover data: de img-src
+
+**Archivos:** `middleware/security.go`
+
+**Qué hacer:**
+- CSP: `img-src 'self'` (sin `data:`)
+
+**Archivos modificados:** 1
+**Líneas:** 1
+
+### Extra: Plan inválido retorna 400
+
+**Archivos:** `docgen/handler.go:Pay`
+
+**Qué hacer:**
+- En el switch de plan, agregar `default: http.Error(w, "Plan invalido", 400)`
+
+**Archivos modificados:** 1
+**Líneas:** 2
+
+### Extra: Excel sheet name dinámico
+
+**Archivos:** `docgen/handler.go:DataUpload`
+
+**Qué hacer:**
+- Cambiar `f.GetRows("Sheet1")` por `f.GetRows(f.GetSheetList()[0])`
+
+**Archivos modificados:** 1
+**Líneas:** 1
+
+### Extra: flow_token en generateAndServe
+
+**Archivos:** `docgen/handler.go`
+
+**Qué hacer:**
+- `generateAndServe()` acepta `flowToken string` y lo almacena en `payments.flow_token`
+
+**Archivos modificados:** 1
+**Líneas:** 3
+
+---
+
 ## Fase 2 — Flow.cl real
 
 ### 11. Handler creación de pago Flow.cl
@@ -359,10 +600,12 @@ find /app/backups -name "*.db" -mtime +30 -delete
 
 | Fase | Archivos modificados | Líneas totales | Riesgo |
 |------|---------------------|----------------|--------|
-| F1 — Seguridad | ~8 | ~80 | Bajo (cambios localizados) |
+| F1 — Seguridad | ~8 | ~80 | Bajo (completada) |
+| F1b — Trial + Planes | ~6 | ~220 | Medio (completada) |
+| F1c — 2da ronda auditoría | ~3 | ~100 | Bajo (completada) |
 | F2 — Flow.cl | ~2 | ~125 | Alto (depende de API externa) |
 | F3 — Monitoreo | ~3 | ~90 | Bajo |
 | F4 — Deploy | ~5 nuevos | ~60 | Medio (infraestructura) |
 | F5 — Escalabilidad | ~10 | ~100 | Bajo |
 
-**Total estimado:** ~450 líneas nuevas/modificadas + archivos de infraestructura.
+**Total estimado:** ~775 líneas nuevas/modificadas + archivos de infraestructura.

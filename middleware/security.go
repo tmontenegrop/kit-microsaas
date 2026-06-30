@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	CSP = "default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; form-action 'self'"
+	CSP = "default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; form-action 'self'"
 )
 
 func SecurityHeaders(next http.Handler) http.Handler {

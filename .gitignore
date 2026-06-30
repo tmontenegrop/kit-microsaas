@@ -7,3 +7,4 @@ storage/uploads/
 server_*.log
 node_modules/
 static/input.css
+test_data/
